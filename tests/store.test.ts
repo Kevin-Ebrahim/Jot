@@ -203,3 +203,55 @@ test('a view-only note can recover an unsaved visible draft without modifying it
   const conflictedCopy = await jotStore.copyUnavailableNoteToInbox(source.id, source.revision, { body: 'different visible edit' });
   assert.equal(conflictedCopy.body, 'different visible edit'); assert.notEqual(conflictedCopy.id, recovered.id);
 });
+
+test('a directly shared note with an inaccessible notebook exports and restores to Inbox', async () => {
+  await switchWorkspace(unique());
+  const source = await jotStore.createNote({ title: 'Direct share', body: 'shared note' });
+  const file = await jotStore.addAttachment(source.id, new Blob(['shared file'], { type: 'text/plain' }), 'shared.txt');
+  const linked = await jotStore.updateNote(source.id, { body: `shared attachment:${file.id}` }, source.revision);
+  const db = await (await import('../src/lib/store')).getWorkspaceDb();
+  await db.put('notes', { ...linked, notebookId: crypto.randomUUID(), role: 'viewer', syncState: 'synced', serverVersion: 1 });
+  const sharedNotebook = await jotStore.createNotebook('Shared');
+  await db.put('notebooks', { ...sharedNotebook, name: 'N'.repeat(200), role: 'viewer', syncState: 'synced', serverVersion: 1 });
+  const plaintext = await jotStore.exportBackup();
+  const plainData = JSON.parse(await plaintext.text());
+  assert.equal(plainData.notes[0].notebookId, null);
+  const oldBackup = structuredClone(plainData);
+  oldBackup.notes[0].notebookId = crypto.randomUUID(); // previously exported direct share
+  const encrypted = await jotStore.exportBackup('a secure backup password');
+  const zip = await JSZip.loadAsync(await (await jotStore.exportMarkdownZip()).arrayBuffer());
+  const manifest = JSON.parse(await zip.file('manifest.json')!.async('text'));
+  assert.equal(manifest.notes[0].notebookId, null);
+  assert.ok(Object.keys(zip.files).some(name => name.endsWith('-shared.txt')));
+  for (const [backup, password] of [[plaintext, undefined], [encrypted, 'a secure backup password'],
+    [new Blob([JSON.stringify(oldBackup)]), undefined]] as const) {
+    await switchWorkspace(unique());
+    await jotStore.importBackup(backup, password);
+    const restored = (await jotStore.listNotes())[0];
+    assert.equal(restored.title, 'Direct share'); assert.equal(restored.notebookId, null);
+    assert.equal((await jotStore.listNotebooks())[0].name.length, 200);
+    const restoredFile = (await jotStore.listAttachments(restored.id))[0];
+    assert.equal(await restoredFile.blob.text(), 'shared file');
+    assert.ok(restored.body.includes(`attachment:${restoredFile.id}`));
+  }
+  await switchWorkspace(unique());
+  const tooLong = structuredClone(plainData); tooLong.notebooks[0].name = 'N'.repeat(201);
+  await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(tooLong)])), /invalid notebook/i);
+  assert.equal((await jotStore.listNotes()).length, 0);
+});
+
+test('backup restore rewrites cross-note attachment references without losing the file', async () => {
+  await switchWorkspace(unique());
+  const owner = await jotStore.createNote({ title: 'File owner' });
+  const other = await jotStore.createNote({ title: 'Referencing note' });
+  const attachment = await jotStore.addAttachment(owner.id, new Blob(['cross-note file']), 'cross.txt');
+  await jotStore.updateNote(other.id, { body: `See attachment:${attachment.id}` }, other.revision);
+  const backup = await jotStore.exportBackup();
+  await switchWorkspace(unique()); await jotStore.importBackup(backup);
+  const notes = await jotStore.listNotes();
+  const restoredOwner = notes.find(note => note.title === 'File owner')!;
+  const restoredOther = notes.find(note => note.title === 'Referencing note')!;
+  const restoredFile = (await jotStore.listAttachments(restoredOwner.id))[0];
+  assert.equal(await restoredFile.blob.text(), 'cross-note file');
+  assert.equal(restoredOther.body, `See attachment:${restoredFile.id}`);
+});

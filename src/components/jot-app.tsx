@@ -6,7 +6,7 @@ import { useJot } from '@/lib/use-jot';
 import { useAutoRecurring } from '@/lib/use-auto-recurring';
 import { setRecurringAutomation } from '@/lib/auto-recurring';
 import type { NewNote, Note, Notebook } from '@/lib/types';
-import { extractTasks, prepareNextRecurringNote, rescheduleReview, toggleTaskInBody } from '@/lib/features';
+import { prepareNextRecurringNote, rescheduleReview, toggleTaskInBody } from '@/lib/features';
 import { CollaborationProvider, useCollaboration, AccountDialog, ShareDialog, CommentsPanel } from '@/components/collaboration';
 import { CapturePanel } from '@/components/features/capture-panel';
 import { Sidebar, type View } from './sidebar';
@@ -18,6 +18,8 @@ import { NotebookDialog, type NotebookDialogState } from './notebook-dialog';
 import { useNoteDrafts } from './use-note-drafts';
 import { useDialogFocus } from './use-dialog-focus';
 import { createWorkspaceLease } from './workspace-lease';
+import { createStableNoteMerger } from './note-derivations';
+import { useTaskCount } from './use-task-count';
 
 type Jot = ReturnType<typeof useJot>;
 type Drafts = ReturnType<typeof useNoteDrafts>;
@@ -109,6 +111,9 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   const captureReturnFocus = useRef<HTMLElement | null>(null);
   const creating = useRef(false);
   const previousWorkspace = useRef(jot.workspaceId);
+  const mergeRef = useRef<{ workspaceId: string | null; merge: ReturnType<typeof createStableNoteMerger> }>({ workspaceId: jot.workspaceId, merge: createStableNoteMerger() });
+  if (mergeRef.current.workspaceId !== jot.workspaceId) mergeRef.current = { workspaceId: jot.workspaceId, merge: createStableNoteMerger() };
+  const mergeNotes = mergeRef.current.merge;
   const generationAtRender = workspaceGeneration.current;
 
   useEffect(() => {
@@ -133,13 +138,13 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   useEffect(() => {
     if (previousWorkspace.current === jot.workspaceId) return;
     previousWorkspace.current = jot.workspaceId;
-    setSelectedId(null); setView({ kind: 'all' }); setMobileNoteOpen(false); setCommentsOpen(false); setShareTarget(null); setAllowedRemoteImages(new Set());
+    setSelectedId(null); setView({ kind: 'all' }); setMobileNoteOpen(false); setSearchOpen(false); setCommentsOpen(false); setShareTarget(null); setAllowedRemoteImages(new Set());
   }, [jot.workspaceId]);
 
-  const effectiveNotes = useMemo(() => jot.notes.map((note) => {
-    const draft = drafts.entries[note.id]?.note;
-    return draft ? { ...draft, role: note.role, syncState: note.syncState, serverVersion: note.serverVersion } : note;
-  }), [jot.notes, drafts.entries]);
+  useEffect(() => { if (locked) setSearchOpen(false); }, [locked]);
+
+  const effectiveNotes = useMemo(() => mergeNotes(jot.notes, drafts.entries), [jot.notes, drafts.entries, mergeNotes]);
+  const taskCount = useTaskCount(effectiveNotes, jot.workspaceId);
   const listView = view.kind === 'all' || view.kind === 'inbox' || view.kind === 'starred' || view.kind === 'notebook';
   const filteredNotes = useMemo(() => effectiveNotes.filter((note) => {
     if (view.kind === 'inbox') return !note.notebookId;
@@ -161,13 +166,16 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     return () => { active = false; };
   }, [view.kind, jot.notes, jot.listNotes]);
 
-  const counts = useMemo(() => ({
-    all: effectiveNotes.length,
-    inbox: effectiveNotes.filter((note) => !note.notebookId).length,
-    starred: effectiveNotes.filter((note) => note.pinned).length,
-    tasks: extractTasks(effectiveNotes).filter((task) => !task.done).length,
-    notebooks: Object.fromEntries(jot.notebooks.map((notebook) => [notebook.id, effectiveNotes.filter((note) => note.notebookId === notebook.id).length])),
-  }), [effectiveNotes, jot.notebooks]);
+  const counts = useMemo(() => {
+    let inbox = 0, starred = 0;
+    const notebookCounts: Record<string, number> = {};
+    for (const note of effectiveNotes) {
+      if (note.notebookId) notebookCounts[note.notebookId] = (notebookCounts[note.notebookId] || 0) + 1;
+      else inbox += 1;
+      if (note.pinned) starred += 1;
+    }
+    return { all: effectiveNotes.length, inbox, starred, tasks: taskCount ?? 0, notebooks: notebookCounts };
+  }, [effectiveNotes, taskCount]);
   const selected = effectiveNotes.find((note) => note.id === selectedId) || null;
   const persistedSelected = jot.notes.find((note) => note.id === selectedId) || null;
   const selectedEntry = selectedId ? drafts.entries[selectedId] : undefined;
@@ -189,6 +197,7 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     const notebookId = view.kind === 'notebook' ? view.id || null : null;
     void createNote({ notebookId }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not create a note.')).finally(() => { creating.current = false; });
   }, [createNote, view]);
+  const selectNote = useCallback((id: string) => { setSelectedId(id); setMobileNoteOpen(true); }, []);
   const closeSearch = useCallback(() => setSearchOpen(false), []);
   const closeNotebookDialog = useCallback(() => setNotebookDialog(null), []);
   useEffect(() => {
@@ -313,7 +322,7 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   return <><div className={`jot-app ${mobileNoteOpen ? 'has-mobile-note' : ''}`} inert={locked ? true : undefined} aria-busy={locked}>
     <Sidebar view={view} notebooks={jot.notebooks} counts={counts} online={online} accountAttention={accountAttention} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(next) => { setView(next); setMobileNoteOpen(false); }} onNew={newNote} onCapture={() => { captureProgress.current = null; captureReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setCaptureOpen(true); setSidebarOpen(false); }} onSearch={() => { setSearchOpen(true); setSidebarOpen(false); }} onCreateNotebook={() => setNotebookDialog({ mode: 'create' })} onRenameNotebook={(notebook) => setNotebookDialog({ mode: 'rename', notebook })} onShareNotebook={(notebook) => setShareTarget({ noteId: null, notebookId: notebook.id })} onDeleteNotebook={(notebook) => setNotebookDialog({ mode: 'delete', notebook })} onAccount={() => setAccountOpen(true)} />
     {listView ? <>
-      <NoteList title={listTitle} notes={filteredNotes} notebooks={jot.notebooks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); setMobileNoteOpen(true); }} onNew={newNote} onSearch={() => setSearchOpen(true)} onOpenSidebar={() => setSidebarOpen(true)} />
+      <NoteList title={listTitle} viewKey={`${view.kind}:${view.id || ''}`} notes={filteredNotes} notebooks={jot.notebooks} selectedId={selectedId} onSelect={selectNote} onNew={newNote} onSearch={() => setSearchOpen(true)} onOpenSidebar={() => setSidebarOpen(true)} />
       {selectedDraft ? <NoteEditor draft={selectedDraft} busy={editorBusy} forceReadOnly={persistedSelected?.role === 'viewer'} recoveryAvailable={recoveryAvailable} recoveryUnavailable={persistedSelected?.syncState === 'local'} onCopyUnavailable={copyUnavailable} notes={effectiveNotes} notebooks={jot.notebooks} onChange={(patch) => { if (!editorActionLock.current && !uiLocked.current && persistedSelected?.role !== 'viewer') drafts.change(selectedDraft.note, patch); }} onOpenNote={openNote} onBack={() => setMobileNoteOpen(false)} onOpenSidebar={() => setSidebarOpen(true)} onTrash={() => { void trashSelected(); }} onShare={() => { void runOperation(async () => { const saved = drafts.entries[selectedDraft.note.id] ? await drafts.save(selectedDraft.note.id) : selectedDraft.note; if (!saved) throw new Error('Resolve the unsaved changes before sharing this note.'); setShareTarget({ noteId: saved.id, notebookId: saved.notebookId }); }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not prepare this note for sharing.')); }} onComments={() => setCommentsOpen(true)} onKeepMine={() => { if (!uiLocked.current) void drafts.keepMine(selectedDraft.note.id); }} onUseLatest={() => { if (!uiLocked.current) drafts.useLatest(selectedDraft.note.id); }} onRetry={() => { if (!uiLocked.current) void drafts.retry(selectedDraft.note.id); }} listAttachments={jot.listAttachments} addAttachment={(noteId, file, name) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.addAttachment(noteId, file, name); })} deleteAttachment={(id) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.deleteAttachment(id); })} allowedRemoteImages={allowedRemoteImages} onAllowRemoteImage={(key) => setAllowedRemoteImages((current) => new Set(current).add(key))} onAppendText={async (text) => runOperation(async () => {
         if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed before extraction finished. Please try again.');
         const current = drafts.get(selectedDraft.note).note;
@@ -322,10 +331,10 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
         const saved = await drafts.save(current.id);
         return { saved: !!saved };
       })} /> : <main className="editor"><div className="empty-editor"><div><div className="empty-editor-icon"><FileText size={19} /></div><h2>{jot.isLoading ? 'Opening your notes…' : 'A little space to think.'}</h2><p>{jot.isLoading ? 'Your workspace is being prepared.' : 'Choose a note from the list, or start with a blank page.'}</p>{!jot.isLoading && <button className="button" style={{ marginTop: 18 }} onClick={newNote}><Plus size={14} /> New note</button>}</div></div></main>}
-    </> : <WorkspaceViews view={view} notes={effectiveNotes} deletedNotes={deletedNotes} theme={theme} onTheme={setTheme} onOpenSidebar={() => setSidebarOpen(true)} onOpenNote={openNote} onToggleTask={toggleTask} onReviewed={reviewed} onCreateRecurring={createRecurring} onSetAutomation={setAutomation} onCreate={createNote} onRestore={(note) => runOperation(async () => { await jot.restoreNote(note.id, note.revision); await jot.refresh(); setDeletedNotes((items) => items.filter((item) => item.id !== note.id)); })} onExport={(password) => runTransfer(() => jot.exportBackup(password))} onExportMarkdown={() => runTransfer(() => jot.exportMarkdownZip())} onImport={(file, password) => runTransfer(async () => { await jot.importBackup(file, password); await jot.refresh(); })} onAccount={() => setAccountOpen(true)} />}
+    </> : <WorkspaceViews view={view} notes={effectiveNotes} deletedNotes={deletedNotes} theme={theme} workspaceId={jot.workspaceId} onTheme={setTheme} onOpenSidebar={() => setSidebarOpen(true)} onOpenNote={openNote} onToggleTask={toggleTask} onReviewed={reviewed} onCreateRecurring={createRecurring} onSetAutomation={setAutomation} onCreate={createNote} onRestore={(note) => runOperation(async () => { await jot.restoreNote(note.id, note.revision); await jot.refresh(); setDeletedNotes((items) => items.filter((item) => item.id !== note.id)); })} onExport={(password) => runTransfer(() => jot.exportBackup(password))} onExportMarkdown={() => runTransfer(() => jot.exportMarkdownZip())} onImport={(file, password) => runTransfer(async () => { await jot.importBackup(file, password); await jot.refresh(); })} onAccount={() => setAccountOpen(true)} />}
     {accountAttention && <div className={`account-attention-mobile ${notice || jot.error || automationError ? 'has-app-notice' : ''}`} role="status"><span>{accountAttention}</span><button className="text-button" onClick={() => setAccountOpen(true)}>Review</button></div>}
     {(notice || jot.error || automationError) && <div className="app-notice" role="alert"><span>{notice || jot.error || automationError}</span><button className="icon-button" onClick={() => { setNotice(null); jot.clearError(); clearAutomationError(); }} aria-label="Dismiss"><X size={15} /></button></div>}
-    {searchOpen && <SearchDialog notes={effectiveNotes} onClose={closeSearch} onOpenNote={openNote} />}
+    {searchOpen && <SearchDialog workspaceId={jot.workspaceId} notes={effectiveNotes} onClose={closeSearch} onOpenNote={openNote} />}
     {captureOpen && <CaptureOverlay returnFocus={captureReturnFocus.current}><CapturePanel onClose={closeCapture} onCreate={capture} /></CaptureOverlay>}
     {notebookDialog && <NotebookDialog key={notebookDialog.mode === 'create' ? 'create' : `${notebookDialog.mode}:${notebookDialog.notebook.id}`} state={notebookDialog} onClose={closeNotebookDialog} onSubmit={handleNotebook} />}
     <AccountDialog open={accountOpen} onClose={() => setAccountOpen(false)} />

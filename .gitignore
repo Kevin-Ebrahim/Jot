@@ -25,3 +25,6 @@ next-env.d.ts
 
 # Local self-hosted database (may contain user data)
 /.jot-data/
+
+# Generated, versioned runtimes and language data (from npm dependencies)
+/public/runtime/

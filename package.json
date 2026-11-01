@@ -11,10 +11,13 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "test:offline": "bash scripts/test-offline.sh"
+    "test:offline": "bash scripts/test-offline.sh",
+    "predev": "node scripts/prepare-runtime.mjs",
+    "prebuild": "node scripts/prepare-runtime.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "4.3.2",
+    "@tesseract.js-data/eng": "1.0.0",
     "geist": "^1.5.1",
     "idb": "^8.0.3",
     "jszip": "^3.10.1",

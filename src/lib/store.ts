@@ -1,5 +1,6 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import { withWorkspaceLock } from './workspace-lock';
+import { createAttachmentRewriter } from './attachment-refs';
 import type { AccessRole, Attachment, NewNote, Note, Notebook, NotePatch, OutboxChange, SyncConflict, SyncState } from './types';
 
 export interface JotDB extends DBSchema {
@@ -312,14 +313,15 @@ async function copyUnavailableNoteToInboxLocked(sourceId: string, expectedRevisi
     if (copy && !copy.deletedAt) { await tx.done; return copy; }
   }
   const id = uuid(), timestamp = now();
-  let body = patch.body ?? source.body;
   const attachments = tx.objectStore('attachments');
   const files = await attachments.index('by-note').getAll(source.id);
+  const referenceMap = new Map<string, string>();
   for (const file of files.filter(item => !item.deletedAt)) {
     const newId = uuid();
-    body = body.split(`attachment:${file.id}`).join(`attachment:${newId}`);
+    referenceMap.set(file.id, `attachment:${newId}`);
     await attachments.add({ ...file, id: newId, noteId: id, serverVersion: null, syncState: 'dirty', deletedAt: null });
   }
+  const body = createAttachmentRewriter(referenceMap)(patch.body ?? source.body);
   const copy: Note = { ...source, ...patch, id, body, title: `${(patch.title ?? source.title) || 'Untitled'} (recovered copy)`.slice(0, 300),
     notebookId: null, createdAt: timestamp, updatedAt: timestamp, deletedAt: null, revision: 1,
     serverVersion: null, syncState: 'dirty', role: 'owner' };
@@ -450,8 +452,13 @@ async function snapshotWorkspace(workspace: string | null): Promise<{ notes: Not
     tx.objectStore('notes').getAll(), tx.objectStore('notebooks').getAll(), tx.objectStore('attachments').getAll(),
   ]);
   await tx.done;
+  // A direct note share can legitimately refer to an unshared notebook. A
+  // portable copy must not claim access to that notebook or contain a dangling
+  // reference; preserve the note itself and place its copy in Inbox.
+  const availableNotebooks = new Set(notebooks.filter(notebook => !notebook.deletedAt).map(notebook => notebook.id));
+  const portableNotes = notes.map(note => note.notebookId && !availableNotebooks.has(note.notebookId) ? { ...note, notebookId: null } : note);
   // A deleted attachment is a sync tombstone, not backup content. Never export its bytes.
-  return { notes, notebooks, attachments: attachments.filter(attachment => !attachment.deletedAt) };
+  return { notes: portableNotes, notebooks, attachments: attachments.filter(attachment => !attachment.deletedAt) };
 }
 async function makeBackup(workspace: string | null): Promise<BackupFile> {
   const snapshot = await snapshotWorkspace(workspace);
@@ -522,12 +529,11 @@ async function exportMarkdownZip(): Promise<Blob> {
     attachmentPaths.set(attachment.id, path);
     zip.file(path, await attachment.blob.arrayBuffer());
   }
+  const rewrite = createAttachmentRewriter(new Map([...attachmentPaths].map(([id, path]) => [id, `../${path}`])));
   for (const note of snapshot.notes) {
     const dir = note.deletedAt ? 'trash/' : 'notes/';
     const filename = `${dir}${safeFilename(note.title)}-${note.id}.md`;
-    let body = note.body;
-    for (const [id, path] of attachmentPaths) body = body.split(`attachment:${id}`).join(`../${path}`);
-    zip.file(filename, `# ${note.title || 'Untitled'}\n\n${body}`);
+    zip.file(filename, `# ${note.title || 'Untitled'}\n\n${rewrite(note.body)}`);
   }
   zip.file('manifest.json', JSON.stringify({ format: 'jot-markdown-export', version: 1, exportedAt: now(),
     notebooks: snapshot.notebooks, notes: snapshot.notes.map(({ body: _body, ...metadata }) => metadata) }, null, 2));
@@ -549,7 +555,7 @@ function validDate(value: unknown): value is string {
 }
 /** Check actual UTF-8 bytes, not UTF-16 JavaScript string length. */
 export function assertBackupSize(blob: Blob, limit = BACKUP_LIMIT): void {
-  if (blob.size > limit) throw new Error('Backup exceeds the 150 MB import limit; export smaller workspaces separately.');
+  if (blob.size > limit) throw new Error('Backup exceeds the 150 MiB import limit. Export Markdown ZIP, or back up the server database for an account workspace.');
 }
 function validateBackup(value: unknown): BackupFile {
   if (!plainObject(value) || value.format !== 'jot-backup' || value.version !== 1 || !validDate(value.exportedAt) ||
@@ -559,7 +565,7 @@ function validateBackup(value: unknown): BackupFile {
   const noteIds = new Set<string>(), notebookIds = new Set<string>(), attachmentIds = new Set<string>();
   for (const notebook of value.notebooks) {
     if (!plainObject(notebook) || !validId(notebook.id) || notebookIds.has(notebook.id) ||
-        typeof notebook.name !== 'string' || !notebook.name.trim() || notebook.name.length > 150 ||
+        typeof notebook.name !== 'string' || !notebook.name.trim() || notebook.name.length > 200 ||
         !validDate(notebook.createdAt) || !validDate(notebook.updatedAt) ||
         !(notebook.deletedAt === null || validDate(notebook.deletedAt))) throw new Error('Invalid notebook in backup.');
     notebookIds.add(notebook.id);
@@ -568,7 +574,7 @@ function validateBackup(value: unknown): BackupFile {
     if (!plainObject(note) || !validId(note.id) || noteIds.has(note.id) || typeof note.title !== 'string' || note.title.length > 300 ||
         typeof note.body !== 'string' || note.body.length > 1_000_000 || !Array.isArray(note.tags) || note.tags.length > 50 ||
         note.tags.some(tag => typeof tag !== 'string' || !tag.trim() || tag.length > 80) ||
-        !(note.notebookId === null || (validId(note.notebookId) && notebookIds.has(note.notebookId))) ||
+        !(note.notebookId === null || validId(note.notebookId)) ||
         !validDate(note.createdAt) || !validDate(note.updatedAt) || !(note.deletedAt === null || validDate(note.deletedAt)) ||
         typeof note.pinned !== 'boolean') throw new Error('Invalid note in backup.');
     noteIds.add(note.id);
@@ -603,10 +609,10 @@ async function mergeBackup(value: BackupFile, workspace: string | null): Promise
   const notebooks: Notebook[] = backup.notebooks.map(notebook => ({ id: notebookIds.get(notebook.id)!, name: notebook.name,
     createdAt: notebook.createdAt, updatedAt: notebook.updatedAt, deletedAt: notebook.deletedAt,
     revision: 1, serverVersion: null, syncState: stateForNew(workspace), role: 'owner' }));
+  const rewrite = createAttachmentRewriter(new Map([...attachmentIds].map(([oldId, newId]) => [oldId, `attachment:${newId}`])));
   const notes: Note[] = backup.notes.map(note => {
-    let body = note.body;
-    for (const [oldId, newId] of attachmentIds) body = body.split(`attachment:${oldId}`).join(`attachment:${newId}`);
-    return { id: noteIds.get(note.id)!, title: note.title, body, tags: note.tags, notebookId: note.notebookId ? notebookIds.get(note.notebookId)! : null,
+    const body = rewrite(note.body);
+    return { id: noteIds.get(note.id)!, title: note.title, body, tags: note.tags, notebookId: note.notebookId ? notebookIds.get(note.notebookId) ?? null : null,
       pinned: note.pinned, createdAt: note.createdAt, updatedAt: note.updatedAt, deletedAt: note.deletedAt,
       revision: 1, serverVersion: null, syncState: stateForNew(workspace), role: 'owner' };
   });
@@ -623,7 +629,7 @@ async function mergeBackup(value: BackupFile, workspace: string | null): Promise
 }
 async function importBackup(file: Blob, password?: string): Promise<void> {
   const workspace = getWorkspaceId();
-  if (!(file instanceof Blob) || file.size > BACKUP_LIMIT) throw new Error('Choose a Jot backup smaller than 150 MB.');
+  if (!(file instanceof Blob) || file.size > BACKUP_LIMIT) throw new Error('Choose a Jot backup no larger than 150 MiB.');
   let value: unknown;
   try { value = JSON.parse(await file.text()); } catch { throw new Error('Backup is not valid JSON.'); }
   if (plainObject(value) && value.format === 'jot-encrypted-backup') {
@@ -671,9 +677,9 @@ async function copyGuestNotesToAccountLocked(userId: string): Promise<number> {
   }
   const sourceAttachments = source.attachments.filter(attachment => !attachment.deletedAt && newNoteIds.has(attachment.noteId));
   const attachmentIds = new Map(sourceAttachments.map(attachment => [attachment.id, uuid()]));
+  const rewrite = createAttachmentRewriter(new Map([...attachmentIds].map(([oldId, newId]) => [oldId, `attachment:${newId}`])));
   for (const note of newNotes) {
-    let body = note.body;
-    for (const [oldId, newId] of attachmentIds) body = body.split(`attachment:${oldId}`).join(`attachment:${newId}`);
+    const body = rewrite(note.body);
     const target: Note = { ...note, id: newNoteIds.get(note.id)!, body,
       notebookId: note.notebookId ? notebookMap.get(note.notebookId) ?? null : null,
       revision: 1, serverVersion: null, syncState: 'dirty', role: 'owner' };

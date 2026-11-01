@@ -4,6 +4,7 @@
  * descendants, including initialization that never resolved.
  */
 import { createWorker } from "tesseract.js";
+import { ocrRuntimePaths } from "./runtime-paths";
 
 const scope = globalThis as unknown as {
   onmessage: ((event: MessageEvent<{ file: File }>) => void) | null;
@@ -18,6 +19,7 @@ scope.onmessage = async ({ data }) => {
     let rejectInitialization: (reason: Error) => void = () => undefined;
     const initializationError = new Promise<never>((_, reject) => { rejectInitialization = reject; });
     const initialization = createWorker("eng", 1, {
+      ...ocrRuntimePaths(self.location.origin),
       logger: (progress) => {
         if (progress.status) {
           const percentage = typeof progress.progress === "number" ? ` ${Math.round(progress.progress * 100)}%` : "";

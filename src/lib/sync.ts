@@ -1,5 +1,6 @@
 import { getWorkspaceDb, getWorkspaceId, notifyStoreChanged, ReadOnlyError } from './store';
 import { withWorkspaceLock } from './workspace-lock';
+import { createAttachmentRewriter } from './attachment-refs';
 import type { AccessRole, Attachment, Note, Notebook, OutboxChange, ServerNote, ServerNotebook, SyncConflict, SyncEntity, SyncResult } from './types';
 
 export async function listConflicts(): Promise<SyncConflict[]> {
@@ -43,13 +44,14 @@ async function resolveConflictLocked(id: string, choice: 'local' | 'server' | 'b
         const attachments = tx.objectStore('attachments');
         const oldAttachments = await attachments.index('by-note').getAll(local.id);
         const copyId = crypto.randomUUID();
-        let body = local.body;
+        const referenceMap = new Map<string, string>();
         for (const attachment of oldAttachments.filter(item => !item.deletedAt)) {
           const newId = crypto.randomUUID();
-          body = body.split(`attachment:${attachment.id}`).join(`attachment:${newId}`);
+          referenceMap.set(attachment.id, `attachment:${newId}`);
           await attachments.add({ ...attachment, id: newId, noteId: copyId,
             serverVersion: null, syncState: 'dirty', deletedAt: null });
         }
+        const body = createAttachmentRewriter(referenceMap)(local.body);
         const copy: Note = { ...local, id: copyId, body, title: `${local.title || 'Untitled'} (conflict copy)`.slice(0, 300),
           notebookId: null, createdAt: timestamp, updatedAt: timestamp, deletedAt: null,
           revision: 1, serverVersion: null, syncState: 'dirty', role: 'owner' };

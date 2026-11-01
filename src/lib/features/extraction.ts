@@ -38,8 +38,8 @@ export async function extractPdfText(file: File, onProgress?: ExtractionProgress
 }
 
 /**
- * English OCR runs in a browser worker. Tesseract downloads its worker, engine and
- * trained language data on first use; the selected image itself stays in the worker.
+ * English OCR runs in a browser worker. The app serves its pinned worker, engine
+ * and language data on first use; the selected image itself stays in the worker.
  */
 export async function extractImageText(file: File, onProgress?: ExtractionProgress, signal?: AbortSignal): Promise<string> {
   if (signal?.aborted) throw new DOMException("Canceled", "AbortError");

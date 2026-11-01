@@ -77,6 +77,14 @@ function closeWord(a: string, b: string): boolean {
   if (a === b || (a.length >= 3 && b.startsWith(a))) return true;
   if (a.length < 4 || Math.abs(a.length - b.length) > (a.length > 7 ? 2 : 1)) return false;
   const allowance = a.length > 7 ? 2 : 1;
+  // One edit can disrupt at most two adjacent bigrams. This cheap necessary
+  // condition rejects most unrelated words without changing edit-distance matches.
+  const minimumBigrams = a.length - 1 - 2 * allowance;
+  if (minimumBigrams > 0) {
+    let shared = 0;
+    for (let i = 0; i < a.length - 1; i += 1) if (b.includes(a.slice(i, i + 2))) shared += 1;
+    if (shared < minimumBigrams) return false;
+  }
   let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
   for (let i = 1; i <= a.length; i += 1) {
     const current = [i];
@@ -91,18 +99,38 @@ function closeWord(a: string, b: string): boolean {
   return previous[b.length] <= allowance;
 }
 
-interface WordIndex { text: string; tokens: Set<string>; roots: Set<string>; fuzzy: string[]; }
+const plainBodyCache = new WeakMap<Note, { source: string; text: string }>();
+function notePlainBody(note: Note): string {
+  const cached = plainBodyCache.get(note);
+  if (cached?.source === note.body) return cached.text;
+  const text = plainNoteText(note.body);
+  plainBodyCache.set(note, { source: note.body, text });
+  return text;
+}
+
+interface WordIndex { text: string; tokens: Set<string>; roots: Set<string>; fuzzy: string[]; byLength: Map<number, string[]>; }
 function indexText(value: string): WordIndex {
   const text = normalize(value);
   const tokens = new Set(words(text));
-  return { text, tokens, roots: new Set([...tokens].map(stem)), fuzzy: [...tokens].slice(0, 1600) };
+  const fuzzy = [...tokens].slice(0, 1600);
+  const byLength = new Map<number, string[]>();
+  for (const word of fuzzy) {
+    const bucket = byLength.get(word.length);
+    if (bucket) bucket.push(word); else byLength.set(word.length, [word]);
+  }
+  return { text, tokens, roots: new Set([...tokens].map(stem)), fuzzy, byLength };
 }
 function quality(term: QueryTerm, index: WordIndex): number {
   if (index.tokens.has(term.raw)) return 1;
   if (index.roots.has(term.root)) return .92;
   if ([...term.alternatives].some((alternative) => index.roots.has(alternative))) return .72;
   if (term.raw.length >= 3 && index.fuzzy.some((word) => word.startsWith(term.raw))) return .76;
-  if (term.raw.length >= 4 && index.fuzzy.some((word) => closeWord(term.raw, word))) return .56;
+  if (term.raw.length >= 4) {
+    const allowance = term.raw.length > 7 ? 2 : 1;
+    for (let length = term.raw.length - allowance; length <= term.raw.length + allowance; length += 1) {
+      if (index.byLength.get(length)?.some((word) => closeWord(term.raw, word))) return .56;
+    }
+  }
   return 0;
 }
 interface IndexedNote { title: WordIndex; tags: WordIndex; body: WordIndex; }
@@ -116,7 +144,7 @@ function indexNote(note: Note): IndexedNote {
   // literals and link targets remain searchable even on very long notes.
   const indexed = {
     title: indexText(note.title), tags: indexText(tagText),
-    body: indexText(`${plainNoteText(note.body)} ${note.body.replace(/\\([\\`*_{}\[\]<>#+.!|~\-])/g, "$1")} ${wikiTargets}`),
+    body: indexText(`${notePlainBody(note)} ${note.body.replace(/\\([\\`*_{}\[\]<>#+.!|~\-])/g, "$1")} ${wikiTargets}`),
   };
   indexCache.set(note, { title: note.title, body: note.body, tags: tagText, index: indexed });
   return indexed;
@@ -169,14 +197,18 @@ export function searchNotes(notes: Note[], query: string, options: SearchOptions
 
 /** A safe plain-text excerpt, centered near a useful query word when possible. */
 export function noteSnippet(note: Note, query = "", maxLength = 150): string {
-  const text = plainNoteText(note.body);
+  const text = notePlainBody(note);
   if (text.length <= maxLength) return text;
+  // Note-list previews have no query: avoid scanning every word of every note.
+  if (!query.trim()) return `${text.slice(0, maxLength).trim()}…`;
   const terms = queryTerms(query);
-  const match = [...text.matchAll(/[\p{L}\p{N}]+/gu)].find((candidate) => {
+  let index = -1;
+  // Iterate lazily and stop at the first useful word instead of materializing
+  // every match for long notes or descriptions with no useful words.
+  if (terms.length) for (const candidate of text.matchAll(/[\p{L}\p{N}]+/gu)) {
     const root = stem(normalize(candidate[0]));
-    return terms.some((term) => term.root === root || term.alternatives.has(root));
-  });
-  const index = match?.index ?? -1;
+    if (terms.some((term) => term.root === root || term.alternatives.has(root))) { index = candidate.index ?? -1; break; }
+  }
   const start = index > 30 ? Math.max(0, index - Math.floor(maxLength / 3)) : 0;
   const end = Math.min(text.length, start + maxLength);
   return `${start ? "…" : ""}${text.slice(start, end).trim()}${end < text.length ? "…" : ""}`;

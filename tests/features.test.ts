@@ -293,3 +293,19 @@ test("audio metadata cancellation stops before decoding or model startup", async
     URL.createObjectURL = createUrl; URL.revokeObjectURL = revokeUrl;
   }
 });
+
+test("snippet and connection caches invalidate when a note is edited in place", () => {
+  const a = note("cache-a", "Original target", "First " + "word ".repeat(80), ["shared"]);
+  const b = note("cache-b", "Source", "See [[Original target]]", ["shared"]);
+  assert.match(noteSnippet(a, "", 20), /^First/);
+  assert.deepEqual(getBacklinks([a, b], a).map((item) => item.id), ["cache-b"]);
+  b.body = "Nothing linked";
+  assert.deepEqual(getBacklinks([a, b], a), []);
+  a.body = "Changed " + "word ".repeat(80);
+  assert.match(noteSnippet(a, "", 20), /^Changed/);
+  const c = note("cache-c", "Related", "galactic observatory");
+  const target = note("cache-t", "Target", "galactic observatory");
+  assert.equal(getRelatedNotes([target, c], target).length, 1);
+  c.body = "unrelated aquarium";
+  assert.equal(getRelatedNotes([target, c], target).length, 0);
+});

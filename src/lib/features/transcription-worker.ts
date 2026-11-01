@@ -1,9 +1,8 @@
 /** Disposable Web Worker: all audio inference stays in this browser. */
 import { env, pipeline } from "@huggingface/transformers";
 import { isAudioEffectivelySilent, transcriptionSegments } from "./transcription-segments";
+import { onnxRuntimePaths, whisperFetch, WHISPER_MODEL, WHISPER_REVISION } from "./runtime-paths";
 
-const MODEL = "Xenova/whisper-tiny.en";
-const MODEL_REVISION = "5ba193d28a5ee3cb91de94d6a04fa6f115fb9655";
 const scope = globalThis as unknown as {
   onmessage: ((event: MessageEvent<{ samples: Float32Array }>) => void) | null;
   postMessage(message: { type: "progress" | "done" | "error"; message?: string; text?: string }): void;
@@ -14,13 +13,21 @@ scope.onmessage = async ({ data }) => {
   try {
     const segments = transcriptionSegments(data.samples);
     if (!segments.length || isAudioEffectivelySilent(data.samples)) { scope.postMessage({ type: "done", text: "" }); return; }
-    // One WASM thread works without cross-origin isolation; model files and runtime
-    // are downloaded on demand, while the audio remains a local typed array.
+    // One WASM thread works without cross-origin isolation. The executable
+    // runtime is served by this app; only pinned model data comes from HF.
     env.allowLocalModels = false;
-    if (env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = 1;
+    // Isolate from cached assets produced by older CDN-backed configurations.
+    env.cacheKey = "jot-whisper-5ba193d-local-runtime-v1";
+    const wasm = env.backends.onnx.wasm;
+    if (!wasm) throw new Error("The browser’s WebAssembly runtime is unavailable.");
+    const priorPaths = wasm.wasmPaths;
+    const defaultFactory = priorPaths && typeof priorPaths === "object" ? priorPaths.mjs : undefined;
+    wasm.wasmPaths = onnxRuntimePaths(self.location.origin, defaultFactory);
+    wasm.numThreads = 1;
+    env.fetch = whisperFetch(self.location.origin);
     scope.postMessage({ type: "progress", message: "Loading the English speech model…" });
-    transcriber = await pipeline("automatic-speech-recognition", MODEL, {
-      revision: MODEL_REVISION,
+    transcriber = await pipeline("automatic-speech-recognition", WHISPER_MODEL, {
+      revision: WHISPER_REVISION,
       dtype: "q8",
       device: "wasm",
       progress_callback: (event) => {

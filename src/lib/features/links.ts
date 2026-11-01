@@ -11,16 +11,25 @@ export function extractWikiLinks(markdown: string): WikiLink[] {
     .filter((link) => !!link.title);
 }
 
+const linkCache = new WeakMap<Note, { source: string; links: WikiLink[] }>();
+function noteLinks(note: Note): WikiLink[] {
+  const cached = linkCache.get(note);
+  if (cached?.source === note.body) return cached.links;
+  const links = extractWikiLinks(note.body);
+  linkCache.set(note, { source: note.body, links });
+  return links;
+}
+
 function key(value: string): string { return value.trim().replace(/\s+/g, " ").toLocaleLowerCase(); }
 
 export function getBacklinks(notes: Note[], target: Note): Note[] {
   const title = key(target.title);
   if (!title) return [];
-  return notes.filter((note) => !note.deletedAt && note.id !== target.id && extractWikiLinks(note.body).some((link) => key(link.title) === title));
+  return notes.filter((note) => !note.deletedAt && note.id !== target.id && noteLinks(note).some((link) => key(link.title) === title));
 }
 
 export function getOutgoingLinks(notes: Note[], source: Note): Array<{ link: WikiLink; matches: Note[] }> {
-  return extractWikiLinks(source.body).map((link) => ({
+  return noteLinks(source).map((link) => ({
     link,
     // Duplicate titles are explicitly retained rather than silently choosing one.
     matches: notes.filter((note) => !note.deletedAt && note.id !== source.id && key(note.title) === key(link.title)),
@@ -28,8 +37,13 @@ export function getOutgoingLinks(notes: Note[], source: Note): Array<{ link: Wik
 }
 
 const STOP_WORDS = new Set("about after again also and are been before being between both but can could did does doing for from had has have how into its just more most not our out over same she some than that the their them then there these they this those through too under until very was were what when where which while who will with would you your".split(" "));
+const wordCache = new WeakMap<Note, { title: string; body: string; words: Set<string> }>();
 function meaningfulWords(note: Note): Set<string> {
-  return new Set(`${note.title} ${note.title} ${plainNoteText(note.body)}`.toLocaleLowerCase().match(/[\p{L}\p{N}]{4,}/gu)?.filter((word) => !STOP_WORDS.has(word)).slice(0, 1000) || []);
+  const cached = wordCache.get(note);
+  if (cached?.title === note.title && cached.body === note.body) return cached.words;
+  const result = new Set(`${note.title} ${note.title} ${plainNoteText(note.body)}`.toLocaleLowerCase().match(/[\p{L}\p{N}]{4,}/gu)?.filter((word) => !STOP_WORDS.has(word)).slice(0, 1000) || []);
+  wordCache.set(note, { title: note.title, body: note.body, words: result });
+  return result;
 }
 
 /** Related by shared tags and meaningful words; not an AI/semantic recommendation. */

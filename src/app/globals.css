@@ -362,3 +362,8 @@ code, pre, kbd { font-family: var(--font-mono); }
   .account-attention-mobile span { flex: 1; }
   .account-attention-mobile.has-app-notice { bottom: 70px; }
 }
+.load-more-notes { width: 100%; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--muted); text-align: left; font-size: 11px; }
+.load-more-notes:hover { border-color: var(--border-strong); background: var(--surface-hover); color: var(--text); }
+.load-more-notes span { color: var(--subtle); }
+.import-confirm { display: flex; align-items: flex-start; gap: 8px; margin-top: 11px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.import-confirm input { flex: none; margin-top: 2px; accent-color: var(--accent); }

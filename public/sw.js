@@ -35,7 +35,7 @@ self.addEventListener('fetch', (event) => {
       try { return await fetch(request); }
       catch { return (await (await caches.open(CACHE)).match('/')) || Response.error(); }
     })());
-  } else if (url.pathname.startsWith('/_next/static/')) {
+  } else if (url.pathname.startsWith('/_next/static/') || /^\/runtime\/(?:tesseract|onnx)-[^/]+\//.test(url.pathname)) {
     event.respondWith((async () => {
       const cache = await caches.open(CACHE);
       const cached = await cache.match(request);

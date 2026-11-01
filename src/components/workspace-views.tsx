@@ -1,11 +1,12 @@
 'use client';
 
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { ArrowDownToLine, ArrowUpFromLine, CalendarDays, Check, ChevronRight, FileText, PanelLeft, RotateCcw } from 'lucide-react';
 import type { NewNote, Note } from '@/lib/types';
-import { createFromTemplate, extractTasks, getDueReviews, getPriorMeetings, getRecurringSchedule, getResurfacedNotes, NOTE_TEMPLATES, setRecurringSchedule } from '@/lib/features';
+import { createFromTemplate, getDueReviews, getPriorMeetings, getRecurringSchedule, getResurfacedNotes, NOTE_TEMPLATES, setRecurringSchedule } from '@/lib/features';
 import type { View } from './sidebar';
+import { cachedTasks } from './note-derivations';
 import { isRecurringAutomationEnabled } from '@/lib/auto-recurring';
 
 type Props = {
@@ -13,6 +14,7 @@ type Props = {
   notes: Note[];
   deletedNotes: Note[];
   theme: 'system' | 'dark' | 'light';
+  workspaceId: string | null;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
   onOpenSidebar: () => void;
   onOpenNote: (id: string) => void;
@@ -43,8 +45,8 @@ function download(blob: Blob, name: string) {
 }
 
 export function WorkspaceViews(props: Props) {
-  const { view, notes, deletedNotes, theme, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onSetAutomation, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
-  const tasks = useMemo(() => extractTasks(notes), [notes]);
+  const { view, notes, deletedNotes, theme, workspaceId, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onSetAutomation, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
+  const tasks = useMemo(() => view.kind === 'tasks' ? cachedTasks(notes) : [], [notes, view.kind]);
   const resurfaced = useMemo(() => getResurfacedNotes(notes, new Date(), 20), [notes]);
   const meetings = useMemo(() => getPriorMeetings(notes, new Date(), 5), [notes]);
   const dueReviews = useMemo(() => getDueReviews(notes, new Date(), 20), [notes]);
@@ -52,6 +54,8 @@ export function WorkspaceViews(props: Props) {
   const [password, setPassword] = useState('');
   const [importPassword, setImportPassword] = useState('');
   const [importFile, setImportFile] = useState<File | null>(null);
+  const [confirmAccountImport, setConfirmAccountImport] = useState(false);
+  const accountWorkspace = !!workspaceId;
   const [working, setWorking] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleTitle, setScheduleTitle] = useState('');
@@ -60,6 +64,7 @@ export function WorkspaceViews(props: Props) {
   const [feedback, setFeedback] = useState<{ text: string; error?: boolean } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const reducedMotion = useReducedMotion();
+  useEffect(() => { setConfirmAccountImport(false); setImportFile(null); setImportPassword(''); if (fileRef.current) fileRef.current.value = ''; }, [workspaceId]);
   const run = async (action: () => Promise<void>, success: string) => {
     setWorking(true); setFeedback(null);
     try { await action(); if (success) setFeedback({ text: success }); }
@@ -119,11 +124,11 @@ export function WorkspaceViews(props: Props) {
     <section className="view-section"><h2>Account &amp; privacy</h2><div className="view-row"><div className="view-row-main"><span className="view-row-title">Account and sync</span><span className="view-row-description">Use Jot locally, or sign in to a self-hosted account.</span></div><button className="button" onClick={onAccount}>Manage account</button></div>
       <div className="settings-copy">Notes are stored in this browser. Clearing site data can remove them, so keep a backup. Attachments are stored locally; sync availability depends on the server.</div>
     </section>
-    <section className="view-section"><h2>Back up your work</h2><div className="settings-copy">Export a complete backup, including local attachments. An optional password encrypts the exported backup only—not this browser’s database or account sync. Save the password somewhere safe; it cannot be recovered.</div>
+    <section className="view-section"><h2>Back up your work</h2><div className="settings-copy">The JSON backup includes notes, notebooks, and local attachments, up to 150 MiB encoded. Comments, shares, and account settings require a server database backup. An optional password protects this file only—not browser storage or account sync. Save it safely; it cannot be recovered.</div>
       <label className="settings-label" htmlFor="backup-password">Backup password <span>optional</span></label><div className="settings-action-line"><input id="backup-password" className="field" type="password" autoComplete="new-password" placeholder="Leave blank for an unencrypted backup" value={password} onChange={(event) => setPassword(event.target.value)} /><button className="button" disabled={working} onClick={() => { void run(async () => download(await onExport(password || undefined), `jot-backup-${new Date().toISOString().slice(0, 10)}.json`), password ? 'Encrypted backup downloaded.' : 'Unencrypted backup downloaded.'); }}><ArrowDownToLine size={14} /> Export backup</button></div>
-      <div className="view-row"><div className="view-row-main"><span className="view-row-title">Export Markdown</span><span className="view-row-description">Download notes and attachments as a portable ZIP.</span></div><button className="button" disabled={working} onClick={() => { void run(async () => download(await onExportMarkdown(), `jot-markdown-${new Date().toISOString().slice(0, 10)}.zip`), 'Markdown export downloaded.'); }}>Export ZIP</button></div>
+      <div className="view-row"><div className="view-row-main"><span className="view-row-title">Export Markdown</span><span className="view-row-description">Download notes and attachments as a portable ZIP; server comments and shares are not included.</span></div><button className="button" disabled={working} onClick={() => { void run(async () => download(await onExportMarkdown(), `jot-markdown-${new Date().toISOString().slice(0, 10)}.zip`), 'Markdown export downloaded.'); }}>Export ZIP</button></div>
     </section>
-    <section className="view-section"><h2>Restore a backup</h2><div className="settings-copy">Import merges a Jot backup into this workspace. Existing notes are not overwritten.</div><div className="settings-import"><input ref={fileRef} className="field" type="file" accept=".json,application/json" aria-label="Choose a Jot backup" onChange={(event) => setImportFile(event.target.files?.[0] || null)} /><input className="field" type="password" autoComplete="off" placeholder="Backup password, if encrypted" aria-label="Backup password, if encrypted" value={importPassword} onChange={(event) => setImportPassword(event.target.value)} /><button className="button" disabled={!importFile || working} onClick={() => { if (!importFile) return; void run(async () => { await onImport(importFile, importPassword || undefined); setImportFile(null); setImportPassword(''); if (fileRef.current) fileRef.current.value = ''; }, 'Backup imported.'); }}><ArrowUpFromLine size={14} /> Import backup</button></div></section>
+    <section className="view-section"><h2>Restore a backup</h2><div className="settings-copy">Import merges notes as new copies; existing notes are not overwritten. {accountWorkspace ? 'Imported notes and files are queued to sync to this account when signed in and online.' : 'In the guest workspace, imports stay on this device.'}</div><div className="settings-import"><input ref={fileRef} className="field" type="file" accept=".json,application/json" aria-label="Choose a Jot backup" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setConfirmAccountImport(false); }} /><input className="field" type="password" autoComplete="off" placeholder="Backup password, if encrypted" aria-label="Backup password, if encrypted" value={importPassword} onChange={(event) => setImportPassword(event.target.value)} /><button className="button" disabled={!importFile || working || (accountWorkspace && !confirmAccountImport)} onClick={() => { if (!importFile || (accountWorkspace && !confirmAccountImport)) return; void run(async () => { await onImport(importFile, importPassword || undefined); setImportFile(null); setImportPassword(''); setConfirmAccountImport(false); if (fileRef.current) fileRef.current.value = ''; }, 'Backup imported.'); }}><ArrowUpFromLine size={14} /> {accountWorkspace ? 'Import to account' : 'Import locally'}</button></div>{accountWorkspace && <label className="import-confirm"><input type="checkbox" checked={confirmAccountImport} onChange={(event) => setConfirmAccountImport(event.target.checked)} /> I understand these notes and files will be queued for account sync.</label>}</section>
     <AnimatePresence>{feedback && <motion.div initial={reducedMotion ? { opacity: 0 } : { opacity: 0, transform: 'translateY(5px)' }} animate={{ opacity: 1, transform: 'translateY(0)' }} exit={{ opacity: 0 }} transition={{ duration: .18, ease: [0.23, 1, 0.32, 1] }} className={`notice settings-feedback ${feedback.error ? 'danger' : ''}`} role="status">{!feedback.error && <Check size={15} />}{feedback.text}</motion.div>}</AnimatePresence>
   </div></main>;
 }

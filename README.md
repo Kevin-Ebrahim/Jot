@@ -11,6 +11,8 @@ npm ci
 npm run dev
 ```
 
+The project `.npmrc` skips an unused Node/CUDA runtime download for browser-only inference. If a strict npm version rejects that third-party setting, remove its line and run `ONNXRUNTIME_NODE_INSTALL=skip npm ci`; browser WASM is unaffected.
+
 Open `http://localhost:3000`. This is the default trusted origin. If you use another hostname or port, set `JOT_APP_ORIGIN` to the exact address you will open in the browser; for example:
 
 ```sh
@@ -35,7 +37,7 @@ The server stores its SQLite database in `.jot-data` by default. Set `JOT_DATA_D
 - Share a note or notebook as viewer or editor. Notebook access applies to its notes; a separate note share can grant stronger access. Owners manage shares and trash/restore. Editors can change content and comment. This is versioned polling, **not** character-by-character CRDT co-editing.
 - Attachments are limited to 10 MiB each. Server storage and lifetime attachment-record quotas apply; see [server notes](src/server/README.md).
 
-A production service worker can cache the app shell after a successful first load in a secure context (HTTPS or localhost). Offline availability depends on that installation and browser storage; features needing the network are not available offline. Browser offline reload is still awaiting verification.
+A production service worker can cache the app shell after a successful first load in a secure context (HTTPS or localhost). In a tested browser, after that cache was established, offline reload and editing worked and account sync resumed automatically after reconnecting. Availability still depends on the browser retaining the installed cache and local storage; features needing the network are unavailable offline.
 
 ## Privacy and backups
 

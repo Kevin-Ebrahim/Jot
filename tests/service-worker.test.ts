@@ -15,7 +15,7 @@ test('offline worker precaches shell and assets, serves them offline, and ignore
     const url = new URL(typeof input === 'string' ? input : input.url, base);
     if (url.pathname === '/') return new Response('<html>Jot shell</html>');
     if (url.pathname === '/offline-assets.json') return Response.json({ assets: ['/_next/static/a.js', '/_next/static/a.css'] });
-    if (url.pathname.startsWith('/_next/static/')) return new Response(`asset:${url.pathname}`);
+    if (url.pathname.startsWith('/_next/static/') || url.pathname.startsWith('/runtime/')) return new Response(`asset:${url.pathname}`);
     return new Response('private api response');
   };
   const cache = {
@@ -52,6 +52,16 @@ test('offline worker precaches shell and assets, serves them offline, and ignore
   assert.equal(workerResponse.url, ''); // retain the request's fragment, rather than a cached response URL
   assert.equal(workerResponse.headers.get('Content-Type'), 'application/javascript');
   assert.equal(await workerResponse.text(), 'worker bootstrap');
+  // Runtime is not precached. A user-initiated request caches the versioned
+  // same-origin file, making subsequent use possible without the network.
+  const runtime = '/runtime/tesseract-6.0.1/worker.min.js';
+  assert.equal(await cache.match(runtime), undefined);
+  online = true;
+  handlers.fetch({ request: { method: 'GET', url: `${base}${runtime}`, mode: 'same-origin', destination: 'script' }, respondWith(value: Promise<Response>) { response = value; } });
+  assert.equal(await (await response!).text(), `asset:${runtime}`);
+  online = false;
+  handlers.fetch({ request: { method: 'GET', url: `${base}${runtime}`, mode: 'same-origin', destination: 'script' }, respondWith(value: Promise<Response>) { response = value; } });
+  assert.equal(await (await response!).text(), `asset:${runtime}`);
   let intercepted = false;
   handlers.fetch({ request: { method: 'GET', url: `${base}/api/notes`, mode: 'cors' }, respondWith() { intercepted = true; } });
   assert.equal(intercepted, false);
