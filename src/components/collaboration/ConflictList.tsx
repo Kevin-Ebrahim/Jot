@@ -7,6 +7,7 @@ import { messageForError } from './api';
 import { useCollaboration } from './CollaborationProvider';
 
 type Choice = 'local' | 'server' | 'both';
+type SelectedChoice = { id: string; value: Choice; localRevision: number; serverVersion: number };
 
 function titleOf(item: SyncConflict['local'] | SyncConflict['server']): string {
   return ('title' in item ? item.title : item.name) || 'Untitled';
@@ -29,7 +30,7 @@ export function ConflictList({ active }: { active: boolean }) {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [choice, setChoice] = useState<Choice | null>(null);
+  const [choice, setChoice] = useState<SelectedChoice | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const generation = useRef(0);
@@ -55,10 +56,10 @@ export function ConflictList({ active }: { active: boolean }) {
   }, [active, account.lastSync, load]);
 
   async function confirm(conflict: SyncConflict) {
-    if (!choice || busy) return;
+    if (!choice || choice.id !== conflict.id || busy) return;
     setBusy(true); setError(null); setNotice(null);
     try {
-      await account.resolveConflict(conflict.id, choice, conflict.local.revision);
+      await account.resolveConflict(conflict.id, choice.value, choice.localRevision, choice.serverVersion);
       setExpanded(null); setChoice(null);
       setNotice('Choice saved. Any remaining changes will sync automatically when online.');
       await load();
@@ -76,7 +77,11 @@ export function ConflictList({ active }: { active: boolean }) {
     <section className="collab-section collab-conflicts" aria-labelledby="collab-conflicts-title">
       <div className="collab-section-heading"><div><h3 id="collab-conflicts-title">Sync conflicts</h3><p>Both versions are kept until you choose what to do.</p></div><AlertTriangle size={18} aria-hidden="true" /></div>
       {loading && <div className="collab-state" role="status"><LoaderCircle className="collab-spin" size={15} aria-hidden="true" /> Checking for conflicts…</div>}
-      {conflicts.map((conflict) => <div className="collab-conflict" key={conflict.id}>
+      {conflicts.map((conflict) => {
+        const selected = choice?.id === conflict.id && choice.localRevision === conflict.local.revision && choice.serverVersion === conflict.serverVersion ? choice.value : null;
+        const staleChoice = choice?.id === conflict.id && !selected;
+        const choose = (value: Choice) => setChoice({ id: conflict.id, value, localRevision: conflict.local.revision, serverVersion: conflict.serverVersion });
+        return <div className="collab-conflict" key={conflict.id}>
         <div className="collab-conflict-heading"><div className="collab-grow"><div className="collab-strong">{titleOf(conflict.local)}</div><div className="collab-hint">{conflict.entity === 'note' ? 'Note' : 'Notebook'} · server version {conflict.serverVersion}</div></div>
           <button type="button" className="collab-button collab-ghost" onClick={() => { setExpanded(expanded === conflict.id ? null : conflict.id); setChoice(null); }} aria-expanded={expanded === conflict.id} disabled={busy}>{expanded === conflict.id ? <>Close <ChevronUp size={14} aria-hidden="true" /></> : <>Review <ChevronDown size={14} aria-hidden="true" /></>}</button>
         </div>
@@ -85,14 +90,15 @@ export function ConflictList({ active }: { active: boolean }) {
             <div><div className="collab-list-heading">Your local version</div><strong>{titleOf(conflict.local)}</strong>{conflict.local.deletedAt && <span className="collab-hint">Marked deleted</span>}{bodyOf(conflict.local) !== null && <pre>{bodyOf(conflict.local) || '(empty)'}</pre>}</div>
             <div><div className="collab-list-heading">Server version</div><strong>{titleOf(conflict.server)}</strong>{conflict.server.deletedAt && <span className="collab-hint">Marked deleted</span>}{bodyOf(conflict.server) !== null && <pre>{bodyOf(conflict.server) || '(empty)'}</pre>}</div>
           </div>
-          {!choice ? <div className="collab-actions collab-actions-start">
-            <button type="button" className="collab-button" disabled={busy || conflict.role === 'viewer'} onClick={() => setChoice('local')}>Keep mine</button>
-            <button type="button" className="collab-button" disabled={busy} onClick={() => setChoice('server')}>Use server</button>
-            <button type="button" className="collab-button" disabled={busy} onClick={() => setChoice('both')}>Keep both</button>
-          </div> : <div className="collab-confirm"><p>{choiceText(conflict, choice)}</p><div className="collab-actions collab-actions-start"><button type="button" className="collab-button collab-primary" disabled={busy} onClick={() => void confirm(conflict)}>{busy ? 'Saving…' : 'Confirm choice'}</button><button type="button" className="collab-button collab-ghost" disabled={busy} onClick={() => setChoice(null)}>Cancel</button></div></div>}
+          {staleChoice && <p className="collab-hint">One of the versions changed. Review the current versions and choose again.</p>}
+          {!selected ? <div className="collab-actions collab-actions-start">
+            <button type="button" className="collab-button" disabled={busy || conflict.role === 'viewer'} onClick={() => choose('local')}>Keep mine</button>
+            <button type="button" className="collab-button" disabled={busy} onClick={() => choose('server')}>Use server</button>
+            <button type="button" className="collab-button" disabled={busy} onClick={() => choose('both')}>Keep both</button>
+          </div> : <div className="collab-confirm"><p>{choiceText(conflict, selected)}</p><div className="collab-actions collab-actions-start"><button type="button" className="collab-button collab-primary" disabled={busy} onClick={() => void confirm(conflict)}>{busy ? 'Saving…' : 'Confirm choice'}</button><button type="button" className="collab-button collab-ghost" disabled={busy} onClick={() => setChoice(null)}>Cancel</button></div></div>}
           {conflict.role === 'viewer' && <p className="collab-hint">View-only access cannot replace the server version. You can keep a separate copy instead.</p>}
         </div>}
-      </div>)}
+      </div>; })}
       {notice && <div className="collab-success" role="status">{notice}</div>}
       {error && <div className="collab-alert" role="alert">{error}</div>}
     </section>

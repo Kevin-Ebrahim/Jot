@@ -13,7 +13,7 @@ export interface CollaborationWorkspace {
   syncNow: () => Promise<SyncResult>;
   syncStatus: SyncStatus;
   listConflicts: () => Promise<SyncConflict[]>;
-  resolveConflict: (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number) => Promise<void>;
+  resolveConflict: (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number) => Promise<void>;
 }
 
 type SessionStatus = 'checking' | 'ready' | 'error';
@@ -39,7 +39,7 @@ interface CollaborationContextValue {
   syncNow: () => Promise<SyncResult>;
   importGuestNotes: () => Promise<number>;
   listConflicts: () => Promise<SyncConflict[]>;
-  resolveConflict: (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number) => Promise<void>;
+  resolveConflict: (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number) => Promise<void>;
   authenticatedRequest: <T>(path: string, options?: RequestOptions) => Promise<T>;
 }
 
@@ -273,12 +273,12 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     return workspaceRef.current.listConflicts();
   }, [session, workspaceReady]);
 
-  const resolveConflict = useCallback(async (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number) => {
+  const resolveConflict = useCallback(async (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number) => {
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before resolving conflicts.');
     if (resolutionInFlight.current) throw new Error('A conflict is already being resolved.');
     const pending = (async () => {
       if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
-      await workspaceRef.current.resolveConflict(id, choice, expectedRevision);
+      await workspaceRef.current.resolveConflict(id, choice, expectedRevision, expectedServerVersion);
       const remaining = await workspaceRef.current.listConflicts();
       if (mounted.current) {
         setSyncMessage(remaining.length ? `${remaining.length} ${remaining.length === 1 ? 'conflict needs' : 'conflicts need'} your attention. Your local changes were kept.` : null);
