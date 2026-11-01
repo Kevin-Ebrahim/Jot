@@ -18,16 +18,31 @@ await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
 const port = probe.address().port;
 await new Promise(resolve => probe.close(resolve));
 const origin = `http://127.0.0.1:${port}`;
-const child = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '--hostname', '127.0.0.1', '--port', String(port)], {
-  cwd: process.cwd(), env: { ...process.env, JOT_DATA_DIR: directory, JOT_ALLOW_REGISTRATION: 'true', JOT_ENCRYPTION_KEY: '44'.repeat(32), JOT_APP_ORIGIN: origin, JOT_SECURE_COOKIES: 'false' }, stdio: ['ignore', 'pipe', 'pipe'],
-});
+const testKey = '44'.repeat(32);
+let child;
 let output = '';
-child.stdout.on('data', chunk => { output += chunk; });
-child.stderr.on('data', chunk => { output += chunk; });
-async function ready() {
+function start(key) {
+  const env = { ...process.env, JOT_DATA_DIR: directory, JOT_ALLOW_REGISTRATION: 'true', JOT_APP_ORIGIN: origin, JOT_SECURE_COOKIES: 'false' };
+  delete env.JOT_TRUST_PROXY_IP_HEADER;
+  if (key === undefined) delete env.JOT_ENCRYPTION_KEY; else env.JOT_ENCRYPTION_KEY = key;
+  child = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '--hostname', '127.0.0.1', '--port', String(port)], {
+    cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+}
+async function stop() {
+  if (!child || child.exitCode !== null) return;
+  const exited = new Promise(resolve => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  await Promise.race([exited, delay(3000)]);
+  if (child.exitCode === null) { child.kill('SIGKILL'); await exited; }
+}
+async function ready(expectedStatus = 200) {
   for (let i = 0; i < 100; i++) {
     if (child.exitCode !== null) throw new Error(`Server exited early: ${output}`);
-    try { if ((await fetch(`${origin}/api/auth/session`)).ok) return; } catch { /* still starting */ }
+    try { if ((await fetch(`${origin}/api/auth/session`)).status === expectedStatus) return; } catch { /* still starting */ }
     await delay(100);
   }
   throw new Error(`Server did not start: ${output}`);
@@ -45,8 +60,8 @@ async function account(label) {
   assert.equal(res.status, 201, JSON.stringify(value));
   return { ...value, cookie: res.headers.get('set-cookie').split(';')[0] };
 }
-let stopped = false;
 try {
+  start(testKey);
   await ready();
   const owner = await account('owner');
   const editor = await account('editor');
@@ -91,18 +106,39 @@ try {
   assert.equal((await call('/api/notes', { account: owner, headers: { 'X-Jot-Workspace': editor.user.id } })).status, 409);
   const badOrigin = await call(`/api/notes/${note.id}`, { method: 'PUT', account: owner, headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' }, body: JSON.stringify(payload) });
   assert.equal(badOrigin.status, 403);
-  child.kill('SIGTERM');
-  await new Promise(resolve => child.once('exit', resolve)); stopped = true;
+  await stop();
   const disk = readFileSync(path.join(directory, 'jot.sqlite'));
   for (const secret of ['uniquely private live smoke body', 'editor saved body', 'private notebook smoke', 'private title smoke', 'private live comment', 'private filename.txt', 'private attachment bytes']) {
     assert.ok(!disk.includes(Buffer.from(secret)), `${secret} leaked to the database file`);
   }
-  console.log('Production HTTP smoke passed: accounts, notebook ACL, CAS/idempotency, comments, attachments, origin/workspace guards and encrypted disk content.');
-} finally {
-  if (!stopped && child.exitCode === null) {
-    child.kill('SIGTERM');
-    await Promise.race([new Promise(resolve => child.once('exit', resolve)), delay(3000)]);
-    if (child.exitCode === null) child.kill('SIGKILL');
+  // Sessions, login and inherited permissions survive a real process restart.
+  start(testKey); await ready();
+  response = await json('/api/auth/session', { account: owner });
+  assert.equal(response.value.user.id, owner.user.id);
+  response = await json('/api/auth/login', { method: 'POST', body: { email: editor.user.email, password: 'synthetic test password' } });
+  assert.equal(response.res.status, 200);
+  const signedInAgain = { ...response.value, cookie: response.res.headers.get('set-cookie').split(';')[0] };
+  assert.equal((await json('/api/notes', { account: signedInAgain })).value.notes[0].note.body, 'editor saved body');
+  assert.equal((await json(`/api/notes/${note.id}/comments`, { account: signedInAgain })).value.comments[0].body, 'private live comment');
+  assert.equal(await (await call(attachmentPath, { account: signedInAgain })).text(), 'private attachment bytes');
+  response = await json(`/api/notebooks/${book.id}/shares`, { method: 'DELETE', account: owner, body: { email: editor.user.email } });
+  assert.equal(response.res.status, 200);
+  assert.deepEqual((await json('/api/notes', { account: signedInAgain })).value.notes, []);
+  assert.equal((await call(attachmentPath, { account: signedInAgain })).status, 404);
+  await stop();
+  // A missing or wrong key never falls back to plaintext or modifies data.
+  for (const wrongKey of [undefined, '55'.repeat(32)]) {
+    start(wrongKey); await ready(500);
+    response = await json('/api/auth/session', { account: owner });
+    assert.equal(response.res.status, 500);
+    assert.deepEqual(response.value, { error: 'Internal server error' });
+    await stop();
   }
+  start(testKey); await ready();
+  assert.equal((await json('/api/notes', { account: owner })).value.notes[0].note.body, 'editor saved body');
+  await stop();
+  console.log('Production HTTP smoke passed: encrypted restart/key failures, account login, ACL/revocation, CAS/idempotency, comments, attachments, origin/workspace guards and encrypted disk content.');
+} finally {
+  await stop();
   rmSync(directory, { recursive: true, force: true });
 }
