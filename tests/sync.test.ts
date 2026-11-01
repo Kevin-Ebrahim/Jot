@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto';
+import './web-locks';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getWorkspaceDb, jotStore, switchWorkspace } from '../src/lib/store';
@@ -15,8 +16,11 @@ function fakeServer(userId: string) {
   let offline = false;
   let calls = 0;
   let failNextWrite = false;
+  let loseAttachmentResponse = false;
+  let delayedAttachment: { method: string; arrived: () => void; gate: Promise<void> } | undefined;
   const revoked = new Set<string>();
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
+  const serverNoteVersion = (id: string) => notes.get(id)?.version;
   const handler: typeof fetch = async (input, init) => {
     if (offline) throw new TypeError('offline');
     calls += 1;
@@ -33,11 +37,20 @@ function fakeServer(userId: string) {
     if (attachmentMatch) {
       const [, noteId, id] = attachmentMatch;
       if (!id) return json({ attachments: [...attachments.values()].map(item => item.metadata).filter(item => item.noteId === noteId) });
+      if (delayedAttachment && init?.method === delayedAttachment.method) {
+        const pending = delayedAttachment; delayedAttachment = undefined; pending.arrived(); await pending.gate;
+      }
+      if (init?.method === 'PUT' || init?.method === 'DELETE') {
+        const expected = Number(headers.get('X-Jot-Note-Version'));
+        if (serverNoteVersion(noteId) !== expected) return json({ error: 'Note version changed; refresh before modifying attachments' }, 409);
+      }
       if (init?.method === 'PUT') {
         const blob = init.body as Blob;
         const metadata = { id, noteId, name: decodeURIComponent(headers.get('X-Jot-Filename')!), mimeType: headers.get('Content-Type'),
           size: blob.size, createdAt: headers.get('X-Jot-Created-At'), deletedAt: null };
-        attachments.set(id, { metadata, bytes: await blob.arrayBuffer() }); return json({ attachment: metadata });
+        attachments.set(id, { metadata, bytes: await blob.arrayBuffer() });
+        if (loseAttachmentResponse) { loseAttachmentResponse = false; throw new TypeError('attachment response lost'); }
+        return json({ attachment: metadata });
       }
       const item = attachments.get(id);
       if (!item) return json({ error: 'Not found' }, 404);
@@ -72,7 +85,15 @@ function fakeServer(userId: string) {
   };
   return { notes, notebooks, attachments, handler, setSession(id: string) { sessionUser = id; },
     loseNextResponse() { offlineAfterWrite = true; }, reconnect() { offline = false; }, callCount() { return calls; },
-    rejectNextWrite() { failNextWrite = true; }, revoke(id: string) { revoked.add(id); } };
+    rejectNextWrite() { failNextWrite = true; }, revoke(id: string) { revoked.add(id); },
+    loseNextAttachmentResponse() { loseAttachmentResponse = true; },
+    delayAttachment(method: 'PUT' | 'DELETE') {
+      let arrive!: () => void, release!: () => void;
+      const arrived = new Promise<void>(resolve => { arrive = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      delayedAttachment = { method, arrived: arrive, gate };
+      return { arrived, release };
+    } };
 }
 
 test('syncs account notes, notebooks and attachment bytes; conflicts preserve both drafts', async () => {
@@ -267,8 +288,84 @@ test('a hung network is aborted while the durable outbox stays available for ret
     init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
   });
   try {
-    await assert.rejects(syncWorkspace(), /abort/i);
+    await assert.rejects(syncWorkspace(), /timed out|abort/i);
     const after = await (await getWorkspaceDb()).getAll('outbox');
     assert.equal(after.length, 1); assert.equal(after[0].operationId, before[0].operationId);
   } finally { globalThis.setTimeout = originalTimeout; }
 });
+
+for (const choice of ['server', 'both'] as const) {
+  test(`${choice} removes a possibly committed attachment after its PUT response was lost`, async () => {
+    const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+    await switchWorkspace(userId);
+    const note = await jotStore.createNote({ title: 'Shared', body: 'initial' });
+    await syncWorkspace();
+    const file = await jotStore.addAttachment(note.id, new Blob(['secret file']), 'secret.txt');
+    server.loseNextAttachmentResponse();
+    const failed = await syncWorkspace();
+    assert.ok(failed.errors.length); assert.ok(server.attachments.has(file.id));
+    assert.equal((await jotStore.listAttachments(note.id))[0].serverVersion, null);
+    const saved = (await jotStore.getNote(note.id))!;
+    await jotStore.updateNote(note.id, { body: `local draft attachment:${file.id}` }, saved.revision);
+    const remote = server.notes.get(note.id)!; remote.data = { ...remote.data, body: 'remote edit' } as ServerNote; remote.version += 1;
+    await syncWorkspace();
+    const conflict = (await listConflicts())[0];
+    await resolveConflict(conflict.id, choice, conflict.local.revision, conflict.serverVersion);
+    const tombstone = await (await getWorkspaceDb()).get('attachments', file.id);
+    assert.ok(tombstone?.deletedAt); assert.equal(tombstone.blob.size, 0);
+    const result = await syncWorkspace();
+    assert.deepEqual(result.errors, []);
+    assert.ok(server.attachments.get(file.id)?.metadata.deletedAt);
+    if (choice === 'both') {
+      const copy = (await jotStore.listNotes()).find(item => item.title.includes('conflict copy'))!;
+      assert.equal((await jotStore.listAttachments(copy.id)).length, 1);
+      assert.equal([...server.attachments.values()].filter(item => item.metadata.noteId === copy.id && !item.metadata.deletedAt).length, 1);
+    }
+  });
+}
+
+test('unsupported Web Locks blocks sync without changing local data', async () => {
+  const original = navigator.locks;
+  Object.defineProperty(navigator, 'locks', { value: undefined, configurable: true });
+  try {
+    await switchWorkspace(crypto.randomUUID());
+    const note = await jotStore.createNote({ title: 'Still local' });
+    await assert.rejects(syncWorkspace(), /Web Locks/i);
+    assert.equal((await jotStore.getNote(note.id))?.title, 'Still local');
+  } finally { Object.defineProperty(navigator, 'locks', { value: original, configurable: true }); }
+});
+
+for (const operation of ['PUT', 'DELETE'] as const) {
+  test(`cross-tab ${operation} cannot race conflict resolution or mutate a newer server note`, async () => {
+    const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+    await switchWorkspace(userId);
+    const note = await jotStore.createNote({ title: 'Shared', body: 'initial' });
+    await syncWorkspace();
+    const file = await jotStore.addAttachment(note.id, new Blob(['shared data']), 'shared.txt');
+    if (operation === 'DELETE') { await syncWorkspace(); await jotStore.deleteAttachment(file.id); }
+    const delayed = server.delayAttachment(operation);
+    const firstSync = syncWorkspace();
+    await delayed.arrived;
+    const saved = (await jotStore.getNote(note.id))!;
+    await jotStore.updateNote(note.id, { body: 'local edit' }, saved.revision);
+    const remote = server.notes.get(note.id)!; remote.data = { ...remote.data, body: 'server edit' } as ServerNote; remote.version += 1;
+    const modulePath = `../src/lib/sync.ts?second-tab=${crypto.randomUUID()}`;
+    const secondTab: typeof import('../src/lib/sync') = await import(modulePath);
+    let secondFinished = false;
+    const secondSync = secondTab.syncWorkspace().then(result => { secondFinished = true; return result; });
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.equal(secondFinished, false, 'second tab must wait for the first tab’s workspace lock');
+    delayed.release();
+    await firstSync;
+    const result = await secondSync;
+    assert.equal(result.conflicts, 1);
+    const conflict = (await secondTab.listConflicts())[0];
+    await secondTab.resolveConflict(conflict.id, 'server', conflict.local.revision, conflict.serverVersion);
+    await secondTab.syncWorkspace();
+    if (operation === 'PUT') assert.equal(server.attachments.has(file.id), false);
+    else {
+      assert.equal(server.attachments.get(file.id)?.metadata.deletedAt, null);
+      assert.equal(await (await jotStore.listAttachments(note.id))[0].blob.text(), 'shared data');
+    }
+  });
+}

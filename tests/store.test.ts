@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto';
+import './web-locks';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import JSZip from 'jszip';
@@ -186,4 +187,17 @@ test('backup import rejects noncanonical dates and blank tags atomically', async
   const badTag = structuredClone(baseline); badTag.notes[0].tags = ['   '];
   await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(badTag)])), /invalid note/i);
   assert.equal((await jotStore.listNotes()).length, 0);
+});
+
+test('a view-only note can recover an unsaved visible draft without modifying its original', async () => {
+  await switchWorkspace(unique());
+  const source = await jotStore.createNote({ title: 'Shared', body: 'stored original' });
+  const db = await (await import('../src/lib/store')).getWorkspaceDb();
+  await db.put('notes', { ...source, role: 'viewer', syncState: 'synced', serverVersion: 1 });
+  const recovered = await jotStore.copyUnavailableNoteToInbox(source.id, source.revision, { body: 'unsaved visible edit', title: 'Shared draft' });
+  assert.equal(recovered.body, 'unsaved visible edit'); assert.equal(recovered.role, 'owner');
+  assert.equal((await jotStore.getNote(source.id))?.body, 'stored original');
+  await db.put('notes', { ...source, role: 'viewer', syncState: 'conflict', serverVersion: 1 });
+  const conflictedCopy = await jotStore.copyUnavailableNoteToInbox(source.id, source.revision, { body: 'different visible edit' });
+  assert.equal(conflictedCopy.body, 'different visible edit'); assert.notEqual(conflictedCopy.id, recovered.id);
 });

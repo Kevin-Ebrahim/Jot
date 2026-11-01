@@ -1,4 +1,5 @@
 import { getWorkspaceDb, getWorkspaceId, notifyStoreChanged, ReadOnlyError } from './store';
+import { withWorkspaceLock } from './workspace-lock';
 import type { AccessRole, Attachment, Note, Notebook, OutboxChange, ServerNote, ServerNotebook, SyncConflict, SyncEntity, SyncResult } from './types';
 
 export async function listConflicts(): Promise<SyncConflict[]> {
@@ -16,7 +17,7 @@ export async function listConflicts(): Promise<SyncConflict[]> {
 }
 
 /** The choice is explicit: never discard either side during automatic reconciliation. */
-export async function resolveConflict(id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number): Promise<void> {
+async function resolveConflictLocked(id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number): Promise<void> {
   const workspace = getWorkspaceId();
   if (!workspace) throw new Error('Conflicts can only be resolved in an account workspace.');
   const db = await getWorkspaceDb(workspace);
@@ -69,7 +70,15 @@ export async function resolveConflict(id: string, choice: 'local' | 'server' | '
       const attachments = tx.objectStore('attachments');
       const localAttachments = await attachments.index('by-note').getAll(current.id);
       for (const attachment of localAttachments) {
-        if (attachment.serverVersion === null || attachment.syncState !== 'synced') await attachments.delete(attachment.id);
+        if (attachment.serverVersion === null) {
+          // A PUT may have committed even if its response was lost. Preserve a
+          // durable discard intent so the next sync removes any server copy.
+          await attachments.put({ ...attachment, blob: new Blob([], { type: 'application/octet-stream' }),
+            deletedAt: attachment.deletedAt ?? new Date().toISOString(), syncState: 'dirty' });
+        } else if (attachment.syncState !== 'synced') {
+          // Cancel an unacknowledged local deletion and re-read server state.
+          await attachments.delete(attachment.id);
+        }
       }
       const remote: Note = { ...conflict.server as ServerNote, revision: current.revision + 1,
         serverVersion: conflict.serverVersion, syncState: 'synced', role: conflict.role };
@@ -87,6 +96,15 @@ export async function resolveConflict(id: string, choice: 'local' | 'server' | '
   notifyStoreChanged(workspace);
 }
 
+
+export async function resolveConflict(id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number): Promise<void> {
+  const workspace = getWorkspaceId();
+  if (!workspace) throw new Error('Conflicts can only be resolved in an account workspace.');
+  return withWorkspaceLock(workspace, async () => {
+    if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; conflict was not resolved.');
+    return resolveConflictLocked(id, choice, expectedRevision, expectedServerVersion);
+  });
+}
 
 type Entity = Note | Notebook;
 type RemoteData = ServerNote | ServerNotebook;
@@ -364,8 +382,8 @@ async function syncAttachments(workspace: string, csrf: string, result: SyncResu
         const path = `${prefix}/${encodeURIComponent(item.id)}`;
         if (item.deletedAt) {
           if (server && !server.deletedAt) {
-            if (note.role === 'viewer') { addError(result, 'An attachment deletion is waiting for edit access.'); continue; }
-            const response = await responseJson(await request(workspace, path, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } }));
+            if (note.role === 'viewer') { addError(result, 'A discarded attachment may remain on the server because you no longer have edit access; ask the owner to remove it.'); continue; }
+            const response = await responseJson(await request(workspace, path, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf, 'X-Jot-Note-Version': String(note.serverVersion) } }));
             await acknowledgeAttachment(workspace, remoteAttachment(response.attachment, note.id));
             result.pushed += 1;
           } else if (server?.deletedAt) {
@@ -398,7 +416,7 @@ async function syncAttachments(workspace: string, csrf: string, result: SyncResu
         if (item.serverVersion === null) {
           if (note.role === 'viewer') { addError(result, 'An attachment is waiting for edit access.'); continue; }
           const response = await responseJson(await request(workspace, path, { method: 'PUT',
-            headers: { 'X-CSRF-Token': csrf, 'X-Jot-Filename': encodeURIComponent(item.name),
+            headers: { 'X-CSRF-Token': csrf, 'X-Jot-Note-Version': String(note.serverVersion), 'X-Jot-Filename': encodeURIComponent(item.name),
               'X-Jot-Created-At': item.createdAt, 'Content-Type': item.mimeType || 'application/octet-stream' }, body: item.blob }));
           await acknowledgeAttachment(workspace, remoteAttachment(response.attachment, note.id));
           result.pushed += 1;
@@ -484,7 +502,10 @@ export function syncWorkspace(): Promise<SyncResult> {
   const controller = new AbortController();
   controllers.set(workspace, controller);
   const timer = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
-  const job = performSync(workspace).finally(() => {
+  const job = withWorkspaceLock(workspace, async () => {
+    if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; sync was cancelled.');
+    return performSync(workspace);
+  }, controller.signal).finally(() => {
     clearTimeout(timer);
     if (controllers.get(workspace) === controller) controllers.delete(workspace);
     if (active.get(workspace) === job) active.delete(workspace);

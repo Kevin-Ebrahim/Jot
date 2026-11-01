@@ -1,4 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { withWorkspaceLock } from './workspace-lock';
 import type { AccessRole, Attachment, NewNote, Note, Notebook, NotePatch, OutboxChange, SyncConflict, SyncState } from './types';
 
 export interface JotDB extends DBSchema {
@@ -269,15 +270,23 @@ async function createRecurringOccurrence(sourceId: string, expectedRevision: num
     tags: input.tags ?? [...source.tags], notebookId: targetId, pinned: input.pinned ?? false,
     createdAt: timestamp, updatedAt: timestamp, deletedAt: null, revision: 1, serverVersion: null,
     syncState: stateForNew(workspace), role: targetRole };
+  const existing = await notes.get(generatedId);
+  if (existing && (existing.deletedAt || existing.title !== occurrence.title || existing.body !== occurrence.body ||
+      existing.notebookId !== occurrence.notebookId || existing.pinned !== occurrence.pinned ||
+      JSON.stringify(existing.tags) !== JSON.stringify(occurrence.tags))) {
+    throw new Error('This recurring occurrence already exists with different content; no changes were made.');
+  }
   const advanced: Note = { ...source, body: sourcePatch.body!, updatedAt: timestamp, revision: source.revision + 1,
     syncState: stateForWrite(source.syncState, workspace) };
-  await notes.put(advanced); await notes.add(occurrence); await tx.done;
+  await notes.put(advanced);
+  if (!existing) await notes.add(occurrence);
+  await tx.done;
   notifyStoreChanged(workspace);
-  return occurrence;
+  return existing ?? occurrence;
 }
 
 /** Explicit recovery after access loss; never silently re-upload the shared source. */
-async function copyUnavailableNoteToInbox(sourceId: string, expectedRevision: number, draftPatch: NotePatch = {}): Promise<Note> {
+async function copyUnavailableNoteToInboxLocked(sourceId: string, expectedRevision: number, draftPatch: NotePatch = {}): Promise<Note> {
   const workspace = getWorkspaceId();
   if (!workspace) throw new Error('Recovery requires an account workspace.');
   const patch = validNotePatch(draftPatch);
@@ -295,7 +304,7 @@ async function copyUnavailableNoteToInbox(sourceId: string, expectedRevision: nu
     if (source) throw new ConflictError(source);
     throw new Error('That local note no longer exists.');
   }
-  if (source.role !== 'viewer' || source.syncState !== 'local') throw new Error('This note does not need access recovery.');
+  if (source.role !== 'viewer') throw new Error('This note does not need view-only recovery.');
   const key = `recovery:${source.id}:${source.revision}:${fingerprint}`;
   const previous = await tx.objectStore('imports').get(key);
   if (previous) {
@@ -319,6 +328,15 @@ async function copyUnavailableNoteToInbox(sourceId: string, expectedRevision: nu
   await tx.done;
   notifyStoreChanged(workspace);
   return copy;
+}
+
+async function copyUnavailableNoteToInbox(sourceId: string, expectedRevision: number, draftPatch: NotePatch = {}): Promise<Note> {
+  const workspace = getWorkspaceId();
+  if (!workspace) throw new Error('Recovery requires an account workspace.');
+  return withWorkspaceLock(workspace, async () => {
+    if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; recovery was cancelled.');
+    return copyUnavailableNoteToInboxLocked(sourceId, expectedRevision, draftPatch);
+  });
 }
 
 async function listNotebooks(): Promise<Notebook[]> {
@@ -609,9 +627,13 @@ async function importBackup(file: Blob, password?: string): Promise<void> {
     try { value = JSON.parse(plaintext); } catch { throw new Error('Decrypted backup is not valid JSON.'); }
   }
   if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; import was cancelled.');
-  await mergeBackup(validateBackup(value), workspace);
+  const merge = async () => {
+    if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; import was cancelled.');
+    await mergeBackup(validateBackup(value), workspace);
+  };
+  if (workspace) await withWorkspaceLock(workspace, merge); else await merge();
 }
-async function copyGuestNotesToAccount(userId: string): Promise<number> {
+async function copyGuestNotesToAccountLocked(userId: string): Promise<number> {
   if (!userId || getWorkspaceId() !== userId) throw new Error('Switch to the matching signed-in account before copying guest notes.');
   const source = await snapshotWorkspace(null);
   if (getWorkspaceId() !== userId) throw new Error('Workspace changed; guest copy was cancelled.');
@@ -663,6 +685,14 @@ async function copyGuestNotesToAccount(userId: string): Promise<number> {
   notifyStoreChanged(userId);
   return newNotes.length;
 }
+async function copyGuestNotesToAccount(userId: string): Promise<number> {
+  if (!userId || getWorkspaceId() !== userId) throw new Error('Switch to the matching signed-in account before copying guest notes.');
+  return withWorkspaceLock(userId, async () => {
+    if (getWorkspaceId() !== userId) throw new Error('Workspace changed; guest copy was cancelled.');
+    return copyGuestNotesToAccountLocked(userId);
+  });
+}
+
 
 export const jotStore = {
   listNotes, getNote, createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox,
