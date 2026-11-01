@@ -86,6 +86,7 @@ function AttachmentCard({ attachment, onDelete, onAppendText }: { attachment: At
 /** Safe attachment previews: raster images and audio only; all other types download. */
 export function AttachmentList({ noteId, listAttachments, addAttachment, deleteAttachment, onAppendText, refreshKey = 0 }: AttachmentListProps) {
   const [items, setItems] = useState<Attachment[]>([]);
+  const [itemsNoteId, setItemsNoteId] = useState(noteId);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const input = useRef<HTMLInputElement>(null);
@@ -101,6 +102,7 @@ export function AttachmentList({ noteId, listAttachments, addAttachment, deleteA
           const existing = previous.find((candidate) => candidate.id === item.id && candidate.size === item.size && candidate.mimeType === item.mimeType);
           return existing ? { ...item, blob: existing.blob } : item;
         }));
+        setItemsNoteId(noteId);
         setError("");
       }
     } catch (cause) { if (request === generation.current && currentNote.current === noteId) setError(cause instanceof Error ? cause.message : "Couldn’t load attachments."); }
@@ -117,11 +119,13 @@ export function AttachmentList({ noteId, listAttachments, addAttachment, deleteA
     finally { if (currentNote.current === noteId) setBusy(false); }
   };
   const remove = deleteAttachment ? async (id: string) => { await deleteAttachment(id); await reload(); } : undefined;
-  if (!items.length && !addAttachment && !error) return null;
+  // Never render one note's cached attachments while another note is loading.
+  const visibleItems = itemsNoteId === noteId ? items : [];
+  if (!visibleItems.length && !addAttachment && !error) return null;
   return <section className={styles.root} aria-label="Attachments">
-    <div className={styles.header}><h3 className={styles.heading}>Attachments <span className={styles.count}>{items.length}</span></h3>{addAttachment && <><button type="button" className={styles.add} onClick={() => input.current?.click()} disabled={busy}><Plus size={13} /> Add file</button><input type="file" ref={input} multiple hidden onChange={(event) => { void add(Array.from(event.target.files || [])); event.target.value = ""; }} /></>}</div>
+    <div className={styles.header}><h3 className={styles.heading}>Attachments <span className={styles.count}>{visibleItems.length}</span></h3>{addAttachment && <><button type="button" className={styles.add} onClick={() => input.current?.click()} disabled={busy}><Plus size={13} /> Add file</button><input type="file" ref={input} multiple hidden onChange={(event) => { void add(Array.from(event.target.files || [])); event.target.value = ""; }} /></>}</div>
     {error && <p className={styles.error} role="alert">{error}</p>}
-    <div className={styles.list}>{items.map((item) => <AttachmentCard key={item.id} attachment={item} onDelete={remove} onAppendText={onAppendText} />)}</div>
-    {onAppendText && items.some(isImage) && <p className={styles.hint}>English image OCR runs locally. Its code and language data download from public CDNs on first use; handwriting may be inaccurate.</p>}
+    <div className={styles.list}>{visibleItems.map((item) => <AttachmentCard key={item.id} attachment={item} onDelete={remove} onAppendText={onAppendText} />)}</div>
+    {onAppendText && visibleItems.some(isImage) && <p className={styles.hint}>English image OCR runs locally. Its code and language data download from public CDNs on first use; handwriting may be inaccurate.</p>}
   </section>;
 }
