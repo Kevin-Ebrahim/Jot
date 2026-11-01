@@ -7,6 +7,7 @@ import { subscribeStore } from "@/lib/store";
 import { extractImageText, extractPdfText } from "@/lib/features/extraction";
 import { escapeImportedText } from "@/lib/features/imported-text";
 import { transcribeAudioOnDevice } from "@/lib/features/audio-transcription";
+import { safeDownloadBlob } from "@/lib/features/safe-attachment";
 import styles from "./attachment-list.module.css";
 
 export interface AttachmentListProps {
@@ -21,16 +22,19 @@ export interface AttachmentListProps {
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const rasterTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp"]);
+const audioPreviewTypes = new Set(["audio/mpeg", "audio/mp3", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/wav", "audio/x-wav", "audio/ogg", "audio/opus", "audio/webm", "audio/flac", "audio/x-flac"]);
 const isImage = (attachment: Attachment) => rasterTypes.has(attachment.mimeType.toLowerCase());
 const isPdf = (attachment: Attachment) => attachment.mimeType.toLowerCase() === "application/pdf" || /\.pdf$/i.test(attachment.name);
 const isAudio = (attachment: Attachment) => {
   const mime = attachment.mimeType.toLowerCase();
   return mime.startsWith("audio/") || ((!mime || mime === "application/octet-stream" || mime.startsWith("video/")) && /\.(?:wav|mp3|m4a|aac|ogg|opus|webm|flac)$/i.test(attachment.name));
 };
+const isSafeAudioPreview = (attachment: Attachment) => audioPreviewTypes.has(attachment.mimeType.toLowerCase().split(";")[0].trim());
 const sizeLabel = (bytes: number) => bytes < 1_000_000 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1_000_000).toFixed(1)} MB`;
 
 function AttachmentCard({ attachment, onDelete, onAppendText }: { attachment: Attachment; onDelete?: (id: string) => Promise<void>; onAppendText?: (markdown: string) => void | { saved: boolean } | Promise<void | { saved: boolean }> }) {
-  const [url, setUrl] = useState("");
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [downloadUrl, setDownloadUrl] = useState("");
   const [status, setStatus] = useState("");
   const [working, setWorking] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -40,10 +44,13 @@ function AttachmentCard({ attachment, onDelete, onAppendText }: { attachment: At
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
-    const objectUrl = URL.createObjectURL(attachment.blob);
-    setUrl(objectUrl);
-    return () => { mounted.current = false; controller.current?.abort(); URL.revokeObjectURL(objectUrl); };
-  }, [attachment.blob]);
+    // Never expose active HTML/SVG as a same-origin navigation target. Downloads
+    // are always octet-stream; only allowlisted media gets an original-type URL.
+    const download = URL.createObjectURL(safeDownloadBlob(attachment.blob));
+    const preview = isImage(attachment) || isSafeAudioPreview(attachment) ? URL.createObjectURL(attachment.blob) : "";
+    setDownloadUrl(download); setPreviewUrl(preview);
+    return () => { mounted.current = false; controller.current?.abort(); URL.revokeObjectURL(download); if (preview) URL.revokeObjectURL(preview); };
+  }, [attachment.blob, attachment.mimeType]);
   const Icon = isImage(attachment) ? FileImage : isAudio(attachment) ? FileAudio : FileText;
 
   const extract = async () => {
@@ -93,10 +100,10 @@ function AttachmentCard({ attachment, onDelete, onAppendText }: { attachment: At
     <div className={styles.info}>
       <div className={styles.name} title={attachment.name}>{attachment.name}</div>
       <div className={styles.meta}>{sizeLabel(attachment.size)}</div>
-      {url && isImage(attachment) && <img className={styles.preview} src={url} alt={attachment.name} />}
-      {url && isAudio(attachment) && <audio className={styles.audio} controls preload="none" src={url}>Your browser cannot play this recording.</audio>}
+      {previewUrl && isImage(attachment) && <img className={styles.preview} src={previewUrl} alt={attachment.name} />}
+      {previewUrl && isSafeAudioPreview(attachment) && <audio className={styles.audio} controls preload="none" src={previewUrl}>Your browser cannot play this recording.</audio>}
       <div className={styles.tools}>
-        {url && <a className={styles.action} href={url} download={attachment.name}><Download size={12} /> Download</a>}
+        {downloadUrl && <a className={styles.action} href={downloadUrl} download={attachment.name}><Download size={12} /> Download</a>}
         {onAppendText && (isImage(attachment) || isPdf(attachment) || isAudio(attachment)) && (working
           ? <button type="button" className={styles.action} disabled={applying} onClick={() => { const previous = controller.current; controller.current = null; previous?.abort(); setWorking(false); setStatus("Processing stopped."); }}>{applying ? "Adding…" : "Stop"}</button>
           : !pendingTranscript && <button type="button" className={styles.action} disabled={applying} onClick={() => void extract()}>{isAudio(attachment) ? "Transcribe on device" : "Make searchable"}</button>)}
@@ -156,7 +163,7 @@ export function AttachmentList({ noteId, listAttachments, addAttachment, deleteA
   return <section className={styles.root} aria-label="Attachments">
     <div className={styles.header}><h3 className={styles.heading}>Attachments <span className={styles.count}>{visibleItems.length}</span></h3>{addAttachment && <><button type="button" className={styles.add} onClick={() => input.current?.click()} disabled={busy}><Plus size={13} /> Add file</button><input type="file" ref={input} multiple hidden onChange={(event) => { void add(Array.from(event.target.files || [])); event.target.value = ""; }} /></>}</div>
     {visibleError && <p className={styles.error} role="alert">{visibleError}</p>}
-    {onAppendText && visibleItems.some(isAudio) && <p className={styles.hint}>On-device transcription is English-only, up to 2 minutes and 10 MiB. First use downloads about 45 MB of model files plus runtime from Hugging Face and a CDN; it can take several minutes. Audio is not sent to a transcription service. If signed in, normal sync may send the attachment and saved transcript to your configured server. Review the result for mistakes.</p>}
+    {onAppendText && visibleItems.some(isAudio) && <p className={styles.hint}>On-device transcription is English-only, up to 2 minutes and 10 MiB. First use downloads about 45 MB of model files from Hugging Face plus runtime from this app or a CDN; it can take several minutes. Audio is not sent to a transcription service. If signed in, normal sync may send the attachment and saved transcript to your configured server. Review the result for mistakes.</p>}
     <div className={styles.list}>{visibleItems.map((item) => <AttachmentCard key={item.id} attachment={item} onDelete={remove} onAppendText={onAppendText} />)}</div>
     {onAppendText && visibleItems.some(isImage) && <p className={styles.hint}>English image OCR runs locally. Its code and language data download from public CDNs on first use; handwriting may be inaccurate.</p>}
   </section>;

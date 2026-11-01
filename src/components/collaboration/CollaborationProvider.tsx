@@ -3,9 +3,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { SyncConflict, SyncResult, SyncStatus } from '@/lib/types';
 import { CollaborationApiError, messageForError, request, type CollaborationSession } from './api';
+import { createSessionRecovery, sessionMatchesWorkspace } from './session-recovery';
 
 export interface CollaborationWorkspace {
   workspaceId: string | null;
+  getCurrentWorkspaceId: () => string | null;
   /** Atomically block workspace edits/transfers and flush drafts; release after the transition. */
   beginWorkspaceTransition: () => Promise<() => void>;
   switchWorkspace: (userId: string | null) => Promise<void>;
@@ -28,6 +30,8 @@ interface CollaborationContextValue {
   session: CollaborationSession | null;
   sessionStatus: SessionStatus;
   sessionError: string | null;
+  pendingSession: CollaborationSession | null;
+  acceptSessionChange: () => Promise<void>;
   workspaceReady: boolean;
   syncStatus: SyncStatus;
   syncMessage: string | null;
@@ -63,6 +67,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   const [session, setSession] = useState<CollaborationSession | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>('checking');
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [pendingSession, setPendingSession] = useState<CollaborationSession | null>(null);
   const [workspacePhase, setWorkspacePhase] = useState<'switching' | 'ready' | 'error'>('switching');
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<SyncResult | null>(null);
@@ -74,6 +79,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   const importInFlight = useRef<Promise<number> | null>(null);
   const activeRelease = useRef<(() => void) | null>(null);
   const activeAuthRequest = useRef<AbortController | null>(null);
+  const refreshInFlight = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -132,35 +138,50 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     }
   }, []);
 
-  const refreshSession = useCallback(async () => {
-    const currentOperation = ++operation.current;
-    setSessionStatus('checking');
-    setSessionError(null);
-    let release: (() => void) | undefined;
-    let requestStarted = false;
-    try {
-      // The shell acquires this lease synchronously before awaiting draft flush.
-      // It also excludes backup transfers and prevents new edits until release.
-      release = await workspaceRef.current.beginWorkspaceTransition();
-      if (currentOperation !== operation.current || !mounted.current) return;
-      activeRelease.current = release;
-      requestStarted = true;
-      const next = validSession(await authRequest<CollaborationSession>('/api/auth/session'));
-      if (currentOperation !== operation.current || !mounted.current) return;
-      await applySession(next, currentOperation);
-    } catch (error) {
-      if (currentOperation === operation.current && mounted.current) {
-        setSessionStatus('error');
-        const message = error instanceof Error ? error.message : 'Local workspace preparation failed.';
-        setSessionError(!requestStarted ? `${message} Your local workspace has not been changed.`
-          : message.startsWith('Could not open the confirmed workspace.') ? message
-            : 'Could not check your session. Your local workspace has not been changed. Check your connection and retry.');
+  const refreshSession = useCallback((): Promise<void> => {
+    if (refreshInFlight.current) return refreshInFlight.current;
+    const pending = (async () => {
+      const currentOperation = ++operation.current;
+      setSessionStatus('checking');
+      setSessionError(null);
+      let release: (() => void) | undefined;
+      let requestStarted = false;
+      try {
+        // The shell acquires this lease synchronously before awaiting draft flush.
+        // It also excludes backup transfers and prevents new edits until release.
+        release = await workspaceRef.current.beginWorkspaceTransition();
+        if (currentOperation !== operation.current || !mounted.current) return;
+        activeRelease.current = release;
+        requestStarted = true;
+        const next = validSession(await authRequest<CollaborationSession>('/api/auth/session'));
+        if (currentOperation !== operation.current || !mounted.current) return;
+        if (!sessionMatchesWorkspace(workspaceRef.current.getCurrentWorkspaceId(), next)) {
+          // Never infer permission to abandon the active offline workspace just
+          // because a different cookie appeared in another tab or after expiry.
+          setPendingSession(next);
+          setSessionStatus('error');
+          setSessionError('The server session differs from this local workspace. Choose whether to switch; nothing will be copied automatically.');
+          return;
+        }
+        setPendingSession(null);
+        await applySession(next, currentOperation);
+      } catch (error) {
+        if (currentOperation === operation.current && mounted.current) {
+          setSessionStatus('error');
+          const message = error instanceof Error ? error.message : 'Local workspace preparation failed.';
+          setSessionError(!requestStarted ? `${message} Your local workspace has not been changed.`
+            : message.startsWith('Could not open the confirmed workspace.') ? message
+              : 'Could not check your session. Your local workspace has not been changed. Check your connection and retry.');
+        }
+        throw error;
+      } finally {
+        release?.();
+        if (activeRelease.current === release) activeRelease.current = null;
       }
-      throw error;
-    } finally {
-      release?.();
-      if (activeRelease.current === release) activeRelease.current = null;
-    }
+    })();
+    refreshInFlight.current = pending;
+    void pending.finally(() => { if (refreshInFlight.current === pending) refreshInFlight.current = null; }).catch(() => undefined);
+    return pending;
   }, [applySession, authRequest]);
 
   useEffect(() => {
@@ -169,6 +190,76 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     const timer = window.setTimeout(() => { void refreshSession().catch(() => undefined); }, 0);
     return () => window.clearTimeout(timer);
   }, [refreshSession]);
+
+  const recoveryState = useRef({ sessionStatus, pendingSession });
+  recoveryState.current = { sessionStatus, pendingSession };
+  const recovery = useRef<ReturnType<typeof createSessionRecovery> | null>(null);
+  useEffect(() => {
+    const controller = createSessionRecovery({
+      canRetry: () => recoveryState.current.sessionStatus === 'error' && !recoveryState.current.pendingSession,
+      isOnline: () => navigator.onLine,
+      isVisible: () => document.visibilityState !== 'hidden',
+      refresh: refreshSession,
+      setTimer: (callback, delay) => window.setTimeout(callback, delay),
+      clearTimer: (id) => window.clearTimeout(id),
+    });
+    recovery.current = controller;
+    const wake = () => controller.wake();
+    window.addEventListener('online', wake);
+    document.addEventListener('visibilitychange', wake);
+    if (recoveryState.current.sessionStatus === 'error' && !recoveryState.current.pendingSession) controller.schedule();
+    return () => {
+      controller.stop();
+      window.removeEventListener('online', wake);
+      document.removeEventListener('visibilitychange', wake);
+      if (recovery.current === controller) recovery.current = null;
+    };
+  }, [refreshSession]);
+  useEffect(() => {
+    if (sessionStatus === 'ready') recovery.current?.reset();
+    else if (sessionStatus === 'error' && !pendingSession) recovery.current?.schedule();
+    else recovery.current?.pause();
+  }, [sessionStatus, pendingSession]);
+
+  const acceptSessionChange = useCallback(async () => {
+    if (!pendingSession) throw new Error('There is no account change to confirm.');
+    const chosenId = pendingSession.user?.id ?? null;
+    const currentOperation = ++operation.current;
+    setSessionStatus('checking'); setSessionError(null);
+    let release: (() => void) | undefined;
+    let requestStarted = false;
+    try {
+      release = await workspaceRef.current.beginWorkspaceTransition();
+      if (currentOperation !== operation.current || !mounted.current) return;
+      activeRelease.current = release;
+      requestStarted = true;
+      // Re-check the cookie immediately before switching. A different identity
+      // needs a new decision; no stale approval is applied to another account.
+      const next = validSession(await authRequest<CollaborationSession>('/api/auth/session'));
+      if (currentOperation !== operation.current || !mounted.current) return;
+      const nextId = next.user?.id ?? null;
+      if (nextId !== chosenId && !sessionMatchesWorkspace(workspaceRef.current.getCurrentWorkspaceId(), next)) {
+        setPendingSession(next);
+        setSessionStatus('error');
+        setSessionError('The server account changed again. Review the current account before switching.');
+        return;
+      }
+      setPendingSession(null);
+      await applySession(next, currentOperation);
+    } catch (error) {
+      if (currentOperation === operation.current && mounted.current) {
+        setSessionStatus('error');
+        const message = error instanceof Error ? error.message : 'Local workspace preparation failed.';
+        setSessionError(!requestStarted ? `${message} Your local workspace has not been changed.`
+          : message.startsWith('Could not open the confirmed workspace.') ? message
+            : 'Could not confirm the server account. Your local workspace has not been changed. Try again.');
+      }
+      throw error;
+    } finally {
+      release?.();
+      if (activeRelease.current === release) activeRelease.current = null;
+    }
+  }, [pendingSession, applySession, authRequest]);
 
   const authenticate = useCallback(async (mode: 'login' | 'register', email: string, password: string) => {
     const currentOperation = ++operation.current;
@@ -187,6 +278,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
       }));
       responseConfirmed = true;
       if (currentOperation !== operation.current || !mounted.current) return;
+      setPendingSession(null);
       await applySession(next, currentOperation);
     } catch (error) {
       if (currentOperation === operation.current && mounted.current && !responseConfirmed) {
@@ -228,6 +320,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
       requestStarted = true;
       await authRequest<{ ok: true }>('/api/auth/logout', { method: 'POST', csrfToken: session.csrfToken, workspaceId: session.user.id });
       serverSignedOut = true;
+      setPendingSession(null);
       await applySession({ user: null, csrfToken: null }, currentOperation);
     } catch (error) {
       if (currentOperation === operation.current && mounted.current) {
@@ -373,9 +466,9 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   }, [session, workspaceReady]);
 
   const value = useMemo<CollaborationContextValue>(() => ({
-    session, sessionStatus, sessionError, workspaceReady, syncStatus: workspace.syncStatus,
+    session, sessionStatus, sessionError, pendingSession, acceptSessionChange, workspaceReady, syncStatus: workspace.syncStatus,
     syncMessage, lastSync, refreshSession, signIn, register, signOut, syncNow, importGuestNotes, listConflicts, resolveConflict, authenticatedRequest,
-  }), [session, sessionStatus, sessionError, workspaceReady, workspace.syncStatus, syncMessage, lastSync, refreshSession, signIn, register, signOut, syncNow, importGuestNotes, listConflicts, resolveConflict, authenticatedRequest]);
+  }), [session, sessionStatus, sessionError, pendingSession, acceptSessionChange, workspaceReady, workspace.syncStatus, syncMessage, lastSync, refreshSession, signIn, register, signOut, syncNow, importGuestNotes, listConflicts, resolveConflict, authenticatedRequest]);
 
   return <CollaborationContext.Provider value={value}>{children}</CollaborationContext.Provider>;
 }

@@ -19,6 +19,7 @@ export function CommentsPanel({ open, onClose, note }: { open: boolean; onClose:
   const [body, setBody] = useState('');
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [uncertainPost, setUncertainPost] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
@@ -66,6 +67,17 @@ export function CommentsPanel({ open, onClose, note }: { open: boolean; onClose:
     }, 30_000);
     return () => { controller.abort(); window.clearInterval(interval); generation.current += 1; };
   }, [open, note?.id, canRead, load, draftKey]);
+
+  async function syncFirst() {
+    if (syncing) return;
+    setSyncing(true); setError(null);
+    try {
+      const result = await account.syncNow();
+      if (result.errors.length) setError(result.errors.join(' '));
+      else if (result.conflicts) setError('Resolve sync conflicts before using comments on this note.');
+    } catch (caught) { setError(messageForError(caught)); }
+    finally { setSyncing(false); }
+  }
 
   async function post(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -133,7 +145,7 @@ export function CommentsPanel({ open, onClose, note }: { open: boolean; onClose:
         {account.sessionStatus !== 'ready' && <div className="collab-alert" role="status">Your account session must be checked before comments can load. Open Account &amp; sync to retry.</div>}
         {account.sessionStatus === 'ready' && !account.session?.user && <p className="collab-copy">Sign in from Account &amp; sync to view and leave comments.</p>}
         {account.sessionStatus === 'ready' && account.session?.user && !account.workspaceReady && <div className="collab-state" role="status"><LoaderCircle className="collab-spin" size={16} aria-hidden="true" /> Opening your account workspace…</div>}
-        {account.sessionStatus === 'ready' && account.session?.user && account.workspaceReady && note.serverVersion === null && <p className="collab-copy">Sync this note to your account before using comments.</p>}
+        {account.sessionStatus === 'ready' && account.session?.user && account.workspaceReady && note.serverVersion === null && (note.role === 'owner' ? <div className="collab-stack"><p className="collab-copy">Sync this note to your account before using comments.</p><button type="button" className="collab-button" onClick={syncFirst} disabled={syncing}><RefreshCw size={15} aria-hidden="true" /> {syncing ? 'Syncing…' : 'Sync now'}</button></div> : <p className="collab-copy">This local copy is not currently available from the server. Check access before using comments.</p>)}
         {canRead && <>
           <div className="collab-comment-toolbar"><span className="collab-list-heading"><MessageSquare size={15} aria-hidden="true" /> Conversation</span><button type="button" className="collab-icon-button" aria-label="Refresh comments" title="Refresh comments" onClick={() => void load(undefined, false, true)} disabled={loading || busy}><RefreshCw size={15} aria-hidden="true" /></button></div>
           {loading ? <div className="collab-state" role="status"><LoaderCircle className="collab-spin" size={15} aria-hidden="true" /> Loading comments…</div>

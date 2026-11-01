@@ -12,7 +12,7 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [busy, setBusy] = useState<'auth' | 'sync' | 'copy' | 'logout' | 'refresh' | null>(null);
+  const [busy, setBusy] = useState<'auth' | 'sync' | 'copy' | 'logout' | 'refresh' | 'accept' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmCopy, setConfirmCopy] = useState(false);
@@ -45,6 +45,14 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
     setBusy('refresh'); setError(null);
     try { await account.refreshSession(); }
     catch { /* The provider supplies the session-specific message. */ }
+    finally { setBusy(null); }
+  }
+
+  async function acceptSessionChange() {
+    if (busy) return;
+    setBusy('accept'); setError(null);
+    try { await account.acceptSessionChange(); }
+    catch { /* The provider supplies the account-specific message. */ }
     finally { setBusy(null); }
   }
 
@@ -92,6 +100,10 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
           <div className="collab-alert" role="alert"><CloudOff size={17} aria-hidden="true" /><span>{account.sessionError || 'Your session could not be checked.'}</span></div>
           <p className="collab-copy">You can keep working in the local workspace already on this device. Sync and sharing are paused until the session is confirmed.</p>
           {account.sessionError && /unsaved|save every draft/i.test(account.sessionError) && <p className="collab-copy">Close this dialog and resolve or preserve the visible draft in its note before checking the session again.</p>}
+          {account.pendingSession && <div className="collab-confirm">
+            <p>{account.pendingSession.user ? `The server is signed in as ${account.pendingSession.user.email}.` : 'The server has no signed-in account.'} Switching opens a separate {account.pendingSession.user ? 'account' : 'guest'} workspace. Your current notes stay on this device and are not copied or uploaded by switching.</p>
+            <div className="collab-actions collab-actions-start"><button type="button" className="collab-button collab-primary" onClick={acceptSessionChange} disabled={!!busy}>{busy === 'accept' ? 'Checking…' : account.pendingSession.user ? 'Switch to this account' : 'Open guest workspace'}</button><button type="button" className="collab-button collab-ghost" onClick={onClose} disabled={!!busy}>Keep working locally</button></div>
+          </div>}
           <button type="button" className="collab-button" onClick={checkSession} disabled={!!busy}>
             <RefreshCw size={15} aria-hidden="true" /> {busy === 'refresh' ? 'Checking…' : 'Check session again'}
           </button>

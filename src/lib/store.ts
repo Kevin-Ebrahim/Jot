@@ -541,7 +541,11 @@ function plainObject(value: unknown): value is Record<string, unknown> {
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 200; }
 function validDate(value: unknown): value is string {
-  return typeof value === 'string' && value.length <= 32 && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) && Number.isFinite(Date.parse(value));
+  if (typeof value !== 'string' || value.length > 32) return false;
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3}))?Z$/.exec(value);
+  if (!match) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === `${match[1]}.${(match[2] || '').padEnd(3, '0')}Z`;
 }
 /** Check actual UTF-8 bytes, not UTF-16 JavaScript string length. */
 export function assertBackupSize(blob: Blob, limit = BACKUP_LIMIT): void {

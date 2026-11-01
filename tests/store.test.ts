@@ -184,6 +184,8 @@ test('backup import rejects noncanonical dates and blank tags atomically', async
   await switchWorkspace(unique());
   const badDate = structuredClone(baseline); badDate.notes[0].updatedAt = '2020-01-01';
   await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(badDate)])), /invalid note/i);
+  const invalidCalendar = structuredClone(baseline); invalidCalendar.notes[0].updatedAt = '2020-02-30T00:00:00.000Z';
+  await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(invalidCalendar)])), /invalid note/i);
   const badTag = structuredClone(baseline); badTag.notes[0].tags = ['   '];
   await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(badTag)])), /invalid note/i);
   assert.equal((await jotStore.listNotes()).length, 0);

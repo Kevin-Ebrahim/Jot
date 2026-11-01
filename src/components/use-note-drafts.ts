@@ -160,6 +160,10 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     };
   }, []);
 
+  const isBusy = useCallback((id: string) => {
+    const entry = entriesRef.current[id];
+    return !!entry && entry.status !== 'saved';
+  }, []);
   const flushAll = useCallback(async () => {
     for (const id of Object.keys(entriesRef.current)) {
       const entry = entriesRef.current[id];
@@ -193,5 +197,5 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     setEntries({});
   }, []);
 
-  return { entries, get, change, save, keepMine, useLatest, retry, flushAll, prepareRecovery, finishRecovery, cancelRecovery, reset };
+  return { entries, get, change, save, keepMine, useLatest, retry, isBusy, flushAll, prepareRecovery, finishRecovery, cancelRecovery, reset };
 }

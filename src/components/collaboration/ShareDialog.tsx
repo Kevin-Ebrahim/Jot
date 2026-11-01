@@ -101,14 +101,14 @@ export function ShareDialog({ open, onClose, note, notebook }: {
         {account.sessionStatus !== 'ready' && <div className="collab-alert" role="status">Your account session must be checked before sharing. Open Account &amp; sync to retry.</div>}
         {account.sessionStatus === 'ready' && !account.session?.user && <p className="collab-copy">Sign in from Account &amp; sync to share. Guest notes remain on this device until you explicitly copy them to your account.</p>}
         {account.sessionStatus === 'ready' && account.session?.user && !account.workspaceReady && <div className="collab-state" role="status"><LoaderCircle className="collab-spin" size={16} aria-hidden="true" /> Opening your account workspace…</div>}
-        {account.sessionStatus === 'ready' && account.session?.user && account.workspaceReady && target.serverVersion === null && (
+        {account.sessionStatus === 'ready' && account.session?.user && account.workspaceReady && target.role === 'owner' && target.serverVersion === null && (
           <div className="collab-stack">
             <p className="collab-copy">This {kind} is only on this device so far. Sync it to your account before sharing.</p>
             <button type="button" className="collab-button" onClick={syncFirst} disabled={busy}><RefreshCw size={15} aria-hidden="true" /> {busy ? 'Syncing…' : 'Sync now'}</button>
           </div>
         )}
-        {account.sessionStatus === 'ready' && account.session?.user && account.workspaceReady && target.serverVersion !== null && target.role !== 'owner' && (
-          <p className="collab-copy">You have {target.role === 'editor' ? 'editing' : 'viewing'} access. Only the owner can manage sharing for this {kind}.</p>
+        {account.sessionStatus === 'ready' && account.session?.user && account.workspaceReady && target.role !== 'owner' && (
+          <p className="collab-copy">{target.serverVersion === null ? 'This local copy is not currently available from the server. ' : `You have ${target.role === 'editor' ? 'editing' : 'viewing'} access. `}Only the owner can manage sharing for this {kind}.</p>
         )}
         {canManage && <>
           {target.syncState !== 'synced' && <div className="collab-confirm"><p>{target.syncState === 'conflict' ? 'This item has an unresolved sync conflict. Resolve it before granting new access; you can still remove existing access.' : 'This item has local changes that are not yet on the server. Sync before granting access so people see the version you intend. You can still remove existing access.'}</p>{target.syncState !== 'conflict' && <button type="button" className="collab-button" onClick={syncFirst} disabled={busy}><RefreshCw size={15} aria-hidden="true" /> {busy ? 'Syncing…' : 'Sync now'}</button>}</div>}

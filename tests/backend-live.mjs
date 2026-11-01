@@ -102,6 +102,15 @@ try {
   const downloaded = await call(attachmentPath, { account: owner });
   assert.equal(downloaded.headers.get('content-type'), 'application/octet-stream');
   assert.equal(await downloaded.text(), 'private attachment bytes');
+  response = await json(`/api/notes/${note.id}`, { method: 'PUT', account: owner, body: { operationId: randomUUID(), baseVersion: 2, note: edited } });
+  assert.equal(response.value.version, 3);
+  const staleDelete = await call(attachmentPath, { method: 'DELETE', account: editor, headers: { 'X-Jot-Note-Version': '2' } });
+  assert.equal(staleDelete.status, 409);
+  assert.equal((await staleDelete.json()).serverVersion, 3);
+  assert.equal(await (await call(attachmentPath, { account: owner })).text(), 'private attachment bytes');
+  const staleUpload = await call(`/api/notes/${note.id}/attachments/${randomUUID()}`, { method: 'PUT', account: editor,
+    headers: { 'Content-Type': 'text/plain', 'X-Jot-Filename': 'stale.txt', 'X-Jot-Created-At': timestamp, 'X-Jot-Note-Version': '2' }, body: 'stale' });
+  assert.equal(staleUpload.status, 409);
   assert.equal((await call(attachmentPath, { account: outsider })).status, 404);
   assert.equal((await call('/api/notes', { account: owner, headers: { 'X-Jot-Workspace': editor.user.id } })).status, 409);
   const badOrigin = await call(`/api/notes/${note.id}`, { method: 'PUT', account: owner, headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' }, body: JSON.stringify(payload) });

@@ -119,15 +119,16 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
     controllers.current.set(item.id, controller);
     updateFile(item.id, { state: "working", message: kind === "pdf" ? "Reading PDF…" : kind === "audio" ? "Preparing local transcription…" : "Loading recognition…", extracted: "" });
     try {
-      const progress = (message: string) => updateFile(item.id, { message });
+      const current = () => controllers.current.get(item.id) === controller && !controller.signal.aborted;
+      const progress = (message: string) => { if (current()) updateFile(item.id, { message }); };
       const text = kind === "pdf" ? await extractPdfText(item.file, progress, controller.signal)
         : kind === "audio" ? await transcribeAudioOnDevice(item.file, progress, controller.signal)
         : await extractImageText(item.file, progress, controller.signal);
-      if (!controller.signal.aborted) updateFile(item.id, text
+      if (current()) updateFile(item.id, text
         ? { state: "done", message: kind === "audio" ? "Review and edit this transcript before saving." : `${text.length.toLocaleString()} characters ready to search`, extracted: text }
         : { state: "empty", message: kind === "pdf" ? "No selectable text found. Scanned PDF pages aren’t recognized yet." : kind === "audio" ? "No speech was recognized. The recording can still be saved." : "No text recognized. You can still save the image.", extracted: "" });
     } catch (cause) {
-      if (!controller.signal.aborted) updateFile(item.id, { state: "error", message: cause instanceof Error ? `${kind === "audio" ? "Transcription" : "Text extraction"} failed: ${cause.message}` : "Processing failed. You can still save the file.", extracted: "" });
+      if (controllers.current.get(item.id) === controller && !controller.signal.aborted) updateFile(item.id, { state: "error", message: cause instanceof Error ? `${kind === "audio" ? "Transcription" : "Text extraction"} failed: ${cause.message}` : "Processing failed. You can still save the file.", extracted: "" });
     } finally {
       if (controllers.current.get(item.id) === controller) controllers.current.delete(item.id);
     }
@@ -373,7 +374,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
           <canvas ref={canvas} className={styles.canvas} width={900} height={420} aria-label="Handwriting canvas" onPointerDown={beginStroke} onPointerMove={moveStroke} onPointerUp={() => { drawing.current = false; }} onPointerCancel={() => { drawing.current = false; }} />
           <div className={styles.actions}><button type="button" className={styles.smallButton} onClick={addSketch} disabled={!hasSketch}>Add sketch</button><button type="button" className={styles.smallButton} onClick={clearSketch} disabled={!hasSketch}>Clear</button></div>
         </div>
-        {files.some((item) => isAudio(item.file)) && <p className={styles.copy} style={{ marginTop: 10 }}>On-device transcription is English-only, up to 2 minutes and 10 MiB. First use downloads about 45 MB of model files plus runtime from Hugging Face and a CDN; it may take several minutes. Audio is not sent to a transcription service. If signed in, normal sync may send the attachment and saved transcript to your configured server. Review the result for mistakes.</p>}
+        {files.some((item) => isAudio(item.file)) && <p className={styles.copy} style={{ marginTop: 10 }}>On-device transcription is English-only, up to 2 minutes and 10 MiB. First use downloads about 45 MB of model files from Hugging Face plus runtime from this app or a CDN; it may take several minutes. Audio is not sent to a transcription service. If signed in, normal sync may send the attachment and saved transcript to your configured server. Review the result for mistakes.</p>}
         {files.length > 0 && <div className={styles.fileList} aria-label="Files to attach">{files.map((item) => {
           const Icon = isImage(item.file) ? FileImage : isAudio(item.file) ? FileAudio : FileText;
           return <div className={styles.fileRow} key={item.id}><Icon className={styles.fileIcon} size={16} /><div className={styles.fileInfo}><div className={styles.fileName} title={item.file.name}>{fileLabel(item.file)}</div><div className={styles.fileStatus} aria-live="polite">{item.message}</div>{isAudio(item.file) && item.state === "done" && <label className={styles.transcriptLabel}>Review transcript<textarea className={styles.transcriptInput} value={item.extracted} onChange={(event) => updateFile(item.id, { extracted: event.target.value })} /></label>}</div><div className={styles.fileActions}>{item.state === "working" ? <button type="button" className={styles.textButton} onClick={() => cancelExtraction(item.id)}>Stop</button> : item.state === "done" ? <button type="button" className={styles.textButton} onClick={() => updateFile(item.id, { state: "ready", message: "Extracted text removed; the file will still be attached.", extracted: "" })}>Keep file only</button> : (isImage(item.file) || isPdf(item.file) || isAudio(item.file)) ? <button type="button" className={styles.textButton} onClick={() => void runExtraction(item, isPdf(item.file) ? "pdf" : isAudio(item.file) ? "audio" : "image")}>{isAudio(item.file) ? "Transcribe on device" : "Make searchable"}</button> : null}<button type="button" className={styles.remove} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button></div></div>;

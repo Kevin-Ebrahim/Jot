@@ -7,6 +7,7 @@ import {
   Star, Trash2, UserRound, Zap,
 } from 'lucide-react';
 import type { Notebook } from '@/lib/types';
+import { useShortcutModifier } from './use-shortcut-modifier';
 
 export type View = { kind: 'all' | 'inbox' | 'starred' | 'tasks' | 'resurface' | 'templates' | 'settings' | 'trash' | 'notebook'; id?: string };
 type Props = {
@@ -29,6 +30,7 @@ type Props = {
 
 export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavigate, onNew, onCapture, onSearch, onCreateNotebook, onRenameNotebook, onShareNotebook, onDeleteNotebook, onAccount }: Props) {
   const [notebookMenu, setNotebookMenu] = useState<string | null>(null);
+  const modifier = useShortcutModifier();
   useEffect(() => {
     if (!notebookMenu) return;
     const outside = (event: MouseEvent) => {
@@ -53,7 +55,7 @@ export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavi
       </div>
       <div className="sidebar-scroll">
         <nav className="nav-group" aria-label="Library">
-          <button className="nav-item" onClick={onSearch}><Search size={16} /><span className="label">Search</span><span className="shortcut">⌘ K</span></button>
+          <button className="nav-item" onClick={onSearch}><Search size={16} /><span className="label">Search</span><span className="shortcut">{modifier} K</span></button>
           <button className={`nav-item ${view.kind === 'all' ? 'active' : ''}`} onClick={() => navigate({ kind: 'all' })}><FileText size={16} /><span className="label">All notes</span><span className="nav-count">{counts.all}</span></button>
           <button className={`nav-item ${view.kind === 'inbox' ? 'active' : ''}`} onClick={() => navigate({ kind: 'inbox' })}><Inbox size={16} /><span className="label">Inbox</span><span className="nav-count">{counts.inbox}</span></button>
           <button className={`nav-item ${view.kind === 'starred' ? 'active' : ''}`} onClick={() => navigate({ kind: 'starred' })}><Star size={16} /><span className="label">Pinned</span>{counts.starred > 0 && <span className="nav-count">{counts.starred}</span>}</button>

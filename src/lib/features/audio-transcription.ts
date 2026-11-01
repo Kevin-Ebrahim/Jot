@@ -42,9 +42,12 @@ export function probeAudioDuration(file: Blob, signal?: AbortSignal): Promise<nu
     };
     const cancel = () => finish(undefined, abortError());
     const failed = () => finish(undefined, new Error("This browser couldn’t read that audio file. Try WAV, MP3, M4A, OGG, or WebM."));
-    const inspect = () => {
-      if (Number.isFinite(media.duration) && media.duration > 0) {
-        try { validateAudioDuration(media.duration); finish(media.duration); }
+    const inspect = (event?: Event) => {
+      // Some duration-less WebM files reveal only the final seek position.
+      const seekEnd = seekingEnd && event?.type === "seeked" && Number.isFinite(media.currentTime) && media.currentTime > 0 && media.currentTime < 1e9 ? media.currentTime : Number.NaN;
+      const duration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : seekEnd;
+      if (Number.isFinite(duration) && duration > 0) {
+        try { validateAudioDuration(duration); finish(duration); }
         catch (error) { finish(undefined, error instanceof Error ? error : new Error("Invalid audio duration.")); }
       } else if (media.readyState >= 1 && !seekingEnd) {
         // MediaRecorder WebM sometimes reports Infinity until it seeks to its end.

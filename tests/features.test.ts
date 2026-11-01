@@ -177,7 +177,9 @@ test("audio decoding stays local and transcription worker cancellation terminate
     readyState = 1;
     preload = "";
     src = "";
-    set currentTime(_value: number) { this.duration = 2; queueMicrotask(() => this.dispatchEvent(new Event("durationchange"))); }
+    private position = 0;
+    get currentTime() { return this.position; }
+    set currentTime(_value: number) { this.position = 2; queueMicrotask(() => this.dispatchEvent(new Event("seeked"))); }
     load() { if (this.src) queueMicrotask(() => this.dispatchEvent(new Event("loadedmetadata"))); }
     removeAttribute() { this.src = ""; }
   }
@@ -246,5 +248,47 @@ test("audio decoding stays local and transcription worker cancellation terminate
     if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else Reflect.deleteProperty(globalThis, "window");
     if (previousWorker) Object.defineProperty(globalThis, "Worker", previousWorker); else Reflect.deleteProperty(globalThis, "Worker");
     URL.createObjectURL = createUrl; URL.revokeObjectURL = revokeUrl; globalThis.fetch = previousFetch;
+  }
+});
+
+
+test("attachment downloads never retain active HTML or SVG MIME types", async () => {
+  const { safeDownloadBlob } = await import("../src/lib/features/safe-attachment");
+  for (const type of ["text/html", "image/svg+xml"]) {
+    const original = new Blob(["<script>bad()</script>"], { type });
+    const safe = safeDownloadBlob(original);
+    assert.equal(safe.type, "application/octet-stream");
+    assert.equal(await safe.text(), await original.text());
+  }
+});
+
+test("audio metadata cancellation stops before decoding or model startup", async () => {
+  const { transcribeAudioOnDevice } = await import("../src/lib/features/audio-transcription");
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const previousWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  const createUrl = URL.createObjectURL, revokeUrl = URL.revokeObjectURL;
+  let revoked = false, decoded = false, workerStarted = false;
+  class PendingMedia extends EventTarget {
+    duration = NaN; readyState = 0; preload = ""; src = "";
+    load() { /* metadata never arrives */ }
+    removeAttribute() { this.src = ""; }
+  }
+  Object.defineProperty(globalThis, "document", { configurable: true, value: { createElement: () => new PendingMedia() } });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { OfflineAudioContext: class { constructor() { decoded = true; } } } });
+  Object.defineProperty(globalThis, "Worker", { configurable: true, value: class { constructor() { workerStarted = true; } } });
+  URL.createObjectURL = () => "blob:local-pending";
+  URL.revokeObjectURL = () => { revoked = true; };
+  try {
+    const controller = new AbortController();
+    const pending = transcribeAudioOnDevice(new Blob(["synthetic"], { type: "audio/wav" }), undefined, controller.signal);
+    controller.abort();
+    await assert.rejects(pending, { name: "AbortError" });
+    assert.equal(revoked, true); assert.equal(decoded, false); assert.equal(workerStarted, false);
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument); else Reflect.deleteProperty(globalThis, "document");
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else Reflect.deleteProperty(globalThis, "window");
+    if (previousWorker) Object.defineProperty(globalThis, "Worker", previousWorker); else Reflect.deleteProperty(globalThis, "Worker");
+    URL.createObjectURL = createUrl; URL.revokeObjectURL = revokeUrl;
   }
 });

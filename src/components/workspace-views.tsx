@@ -6,6 +6,7 @@ import { ArrowDownToLine, ArrowUpFromLine, CalendarDays, Check, ChevronRight, Fi
 import type { NewNote, Note } from '@/lib/types';
 import { createFromTemplate, extractTasks, getDueReviews, getPriorMeetings, getRecurringSchedule, getResurfacedNotes, NOTE_TEMPLATES, setRecurringSchedule } from '@/lib/features';
 import type { View } from './sidebar';
+import { isRecurringAutomationEnabled } from '@/lib/auto-recurring';
 
 type Props = {
   view: View;
@@ -18,6 +19,7 @@ type Props = {
   onToggleTask: (noteId: string, lineIndex: number) => void;
   onReviewed: (noteId: string) => void;
   onCreateRecurring: (source: Note) => Promise<void>;
+  onSetAutomation: (source: Note, enabled: boolean) => Promise<void>;
   onCreate: (input: NewNote) => Promise<void>;
   onRestore: (note: Note) => Promise<void>;
   onExport: (password?: string) => Promise<Blob>;
@@ -41,7 +43,7 @@ function download(blob: Blob, name: string) {
 }
 
 export function WorkspaceViews(props: Props) {
-  const { view, notes, deletedNotes, theme, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
+  const { view, notes, deletedNotes, theme, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onSetAutomation, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
   const tasks = useMemo(() => extractTasks(notes), [notes]);
   const resurfaced = useMemo(() => getResurfacedNotes(notes, new Date(), 20), [notes]);
   const meetings = useMemo(() => getPriorMeetings(notes, new Date(), 5), [notes]);
@@ -101,8 +103,8 @@ export function WorkspaceViews(props: Props) {
           <label>First date<input className="field" type="date" value={scheduleDate} onChange={(event) => setScheduleDate(event.target.value)} required /></label>
           <p>Create an editable source note, then use “Create next” when you’re ready. Add <code>{'{{date}}'}</code> to insert the scheduled date.</p><button className="button primary" disabled={working}>Create source note</button>
         </form>}
-        {schedules.length ? schedules.map(({ note, interval, dueAt }) => <div className="view-row" key={note.id}><div className="view-row-main"><button className="text-button view-row-title" onClick={() => onOpenNote(note.id)}>{note.title || 'Untitled note'}</button><span className="view-row-description">{interval[0].toUpperCase() + interval.slice(1)} · next {formatDay(dueAt)}</span></div><button className="button" disabled={working || note.role === 'viewer'} onClick={() => { void run(() => onCreateRecurring(note), ''); }}>Create next</button></div>) : !scheduleOpen && <div className="empty-view">Create a recurring source note, or add a schedule to an existing note.</div>}
-        <p className="view-footnote">Occurrences are created when you choose “Create next”—not automatically in the background.</p>
+        {schedules.length ? schedules.map(({ note, interval, dueAt }) => { const auto = isRecurringAutomationEnabled(note); return <div className="view-row routine-row" key={note.id}><div className="view-row-main"><button className="text-button view-row-title" onClick={() => onOpenNote(note.id)}>{note.title || 'Untitled note'}</button><span className="view-row-description">{interval[0].toUpperCase() + interval.slice(1)} · next {formatDay(dueAt)}</span></div><div className="routine-actions"><button className="automation-toggle" type="button" role="switch" aria-checked={auto} disabled={working || note.role === 'viewer'} onClick={() => { void run(() => onSetAutomation(note, !auto), ''); }}><span className="toggle-track"><span /></span>Auto while open</button><button className="button" disabled={working || note.role === 'viewer'} onClick={() => { void run(() => onCreateRecurring(note), ''); }}>Create next</button></div></div>; }) : !scheduleOpen && <div className="empty-view">Create a recurring source note, or add a schedule to an existing note.</div>}
+        <p className="view-footnote">Auto creates one due copy while Jot is open, then advances to the next future date. It does not run when Jot is closed; missed copies aren’t backfilled.</p>
       </section>
       <section className="view-section"><h2>Start from a template</h2>{NOTE_TEMPLATES.map((template) => <div className="view-row" key={template.id}><div className="template-icon"><FileText size={16} /></div><div className="view-row-main"><span className="view-row-title">{template.name}</span><span className="view-row-description">{template.description}</span></div><button className="button" disabled={working} onClick={() => { void run(() => onCreate(createFromTemplate(template)), ''); }}>Use template</button></div>)}</section>
     </div></main>;

@@ -4,14 +4,16 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft, Bold, CalendarDays, Check, ChevronRight, CircleAlert, CloudOff,
   Eye, FileText, Heading2, Italic, Link2, List, ListChecks, MessageSquare,
-  MoreHorizontal, PanelLeft, Pin, Plus, Repeat2, Share2, Trash2, X,
+  ImageOff, MoreHorizontal, PanelLeft, Pin, Plus, Repeat2, Share2, Trash2, X,
 } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Attachment, Note, Notebook, NotePatch } from '@/lib/types';
 import { AttachmentList } from '@/components/features/attachment-list';
 import { getBacklinks, getOutgoingLinks, getRecurringSchedule, getRelatedNotes, removeRecurringSchedule, setRecurringSchedule } from '@/lib/features';
 import type { NoteDraft } from './use-note-drafts';
+import { canLoadRemoteImage, isRemoteImageSource, remoteImageKey } from './image-policy';
+import { useShortcutModifier } from './use-shortcut-modifier';
 
 type Props = {
   draft: NoteDraft;
@@ -36,26 +38,32 @@ type Props = {
   addAttachment: (noteId: string, file: Blob, name: string) => Promise<Attachment>;
   deleteAttachment: (id: string) => Promise<void>;
   onAppendText: (text: string) => Promise<{ saved: boolean } | void>;
+  allowedRemoteImages: ReadonlySet<string>;
+  onAllowRemoteImage: (key: string) => void;
 };
 
 const shortDate = (value: string) => new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 
 /** Convert wiki syntax to in-document links, preserving ReactMarkdown's safe rendering. */
 function renderWikiLinks(body: string) {
-  // Leave fenced and inline code alone; links in code are examples, not navigation.
-  return body.split(/(```[\s\S]*?```|`[^`\n]*`)/g).map((part, index) => {
-    if (index % 2) return part;
-    return part.replace(/^\s*Repeat(?: schedule)?\s*:\s*@repeat-note\((?:daily|weekly|monthly|yearly)\s*,\s*\d{4}-\d{2}-\d{2}\)\s*$/gim, '').replace(/\[\[([^\]|\n]+)(?:\|([^\]\n]+))?\]\]/g, (_match, rawTitle: string, rawLabel?: string) => {
+  let inFence = false;
+  return body.split(/(\r?\n)/).map((line) => {
+    if (/^\r?\n$/.test(line)) return line;
+    if (/^\s*```/.test(line)) { inFence = !inFence; return line; }
+    if (inFence) return line;
+    if (/^\s*@repeat-auto\s*$/i.test(line) || /^\s*Repeat(?: schedule)?\s*:\s*@repeat-note\((?:daily|weekly|monthly|yearly)\s*,\s*\d{4}-\d{2}-\d{2}\)\s*$/i.test(line)) return '';
+    return line.split(/(`[^`]*`)/g).map((part, index) => index % 2 ? part : part.replace(/\[\[([^\]|\n]+)(?:\|([^\]\n]+))?\]\]/g, (_match, rawTitle: string, rawLabel?: string) => {
       const title = rawTitle.trim();
       const label = (rawLabel || rawTitle).trim().replace(/([\\\[\]])/g, '\\$1');
       const destination = encodeURIComponent(title).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
       return `[${label}](#jot-wiki-${destination})`;
-    });
+    })).join('');
   }).join('');
 }
 
-export function NoteEditor({ draft, busy = false, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText }: Props) {
+export function NoteEditor({ draft, busy = false, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText, allowedRemoteImages, onAllowRemoteImage }: Props) {
   const note = draft.note;
+  const modifier = useShortcutModifier();
   const viewer = forceReadOnly || note.role === 'viewer';
   const readOnly = viewer || busy;
   const [mode, setMode] = useState<'write' | 'preview'>('preview');
@@ -70,6 +78,8 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
   const [recoverConfirm, setRecoverConfirm] = useState(false);
   const [recoverBusy, setRecoverBusy] = useState(false);
   const [recoverError, setRecoverError] = useState('');
+  const [attachmentVersion, setAttachmentVersion] = useState(0);
+  const [attachmentUrls, setAttachmentUrls] = useState<Record<string, { downloadUrl: string; imageUrl?: string; name: string; mimeType: string }>>({});
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
   const tagRef = useRef<HTMLInputElement>(null);
@@ -98,6 +108,27 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
     const textarea = textareaRef.current;
     if (textarea) { textarea.style.height = 'auto'; textarea.style.height = `${Math.max(380, textarea.scrollHeight)}px`; }
   }, [note.body, mode]);
+  useEffect(() => {
+    let active = true;
+    const urls: string[] = [];
+    setAttachmentUrls({});
+    void listAttachments(note.id).then((items) => {
+      if (!active) return;
+      const next: Record<string, { downloadUrl: string; imageUrl?: string; name: string; mimeType: string }> = {};
+      const rasterTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'];
+      for (const item of items.filter((attachment) => !attachment.deletedAt)) {
+        // Never expose an active HTML/SVG Blob as a navigable same-origin URL.
+        const downloadUrl = URL.createObjectURL(new Blob([item.blob], { type: 'application/octet-stream' })); urls.push(downloadUrl);
+        const mimeType = item.mimeType.toLowerCase();
+        const imageUrl = rasterTypes.includes(mimeType) ? URL.createObjectURL(item.blob) : undefined;
+        if (imageUrl) urls.push(imageUrl);
+        next[item.id] = { downloadUrl, imageUrl, name: item.name, mimeType };
+      }
+      if (active) setAttachmentUrls(next);
+      else urls.forEach((url) => URL.revokeObjectURL(url));
+    }).catch(() => { if (active) setAttachmentUrls({}); });
+    return () => { active = false; urls.forEach((url) => URL.revokeObjectURL(url)); };
+  }, [note.id, listAttachments, attachmentVersion]);
   useEffect(() => {
     if (!menuOpen) return;
     const close = (event: MouseEvent) => { if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false); };
@@ -152,6 +183,10 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
     onChange({ body: `${note.body.slice(0, start)}${prefix}${text}${note.body.slice(end)}` });
     requestAnimationFrame(() => { input.focus(); input.setSelectionRange(start + prefix.length, start + prefix.length + text.length); });
   };
+  const addFile = async (noteId: string, file: Blob, name: string) => {
+    const attachment = await addAttachment(noteId, file, name); setAttachmentVersion((version) => version + 1); return attachment;
+  };
+  const deleteFile = async (id: string) => { await deleteAttachment(id); setAttachmentVersion((version) => version + 1); };
   const statusLabel = draft.status === 'saving' || draft.status === 'dirty' ? 'Saving…'
     : draft.status === 'conflict' ? 'Conflict'
       : draft.status === 'error' ? 'Not saved'
@@ -162,13 +197,15 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
     <main className="editor" aria-label="Note editor" aria-busy={busy}>
       <header className="editor-header">
         <button className="icon-button mobile-only" onClick={onBack} title="Back to notes" aria-label="Back to notes"><ArrowLeft size={17} /></button>
-        <button className="icon-button mobile-only" onClick={onOpenSidebar} title="Open navigation" aria-label="Open navigation"><PanelLeft size={17} /></button>
+        <button className="icon-button mobile-only editor-menu" onClick={onOpenSidebar} title="Open navigation" aria-label="Open navigation"><PanelLeft size={17} /></button>
         <div className="breadcrumb"><span>{notebook?.name || 'Inbox'}</span><ChevronRight size={13} /><span className="current">{title}</span></div>
         <div className="editor-actions">
           <span className="save-indicator" role="status">{draft.status === 'conflict' || draft.status === 'error' || note.syncState === 'conflict' ? <CircleAlert size={13} /> : <Check size={13} />}{statusLabel}</span>
+          <div className="header-divider" />
           <button className={`icon-button ${note.pinned ? 'is-active' : ''}`} onClick={() => onChange({ pinned: !note.pinned })} disabled={readOnly} title={note.pinned ? 'Unpin note' : 'Pin note'} aria-label={note.pinned ? 'Unpin note' : 'Pin note'}><Pin size={16} /></button>
+          <div className="header-divider" />
           <button className="icon-button" disabled={busy} onClick={onComments} title="Comments" aria-label="Comments"><MessageSquare size={16} /></button>
-          <button className="icon-button" disabled={busy} onClick={onShare} title="Share note" aria-label="Share note"><Share2 size={16} /></button>
+          <button className="button ghost header-share" disabled={busy} onClick={onShare} title="Share note" aria-label="Share note"><Share2 size={16} /><span>Share</span></button>
           <div className="header-divider" />
           <div className="popover-wrap" ref={menuRef}>
             <button className="icon-button" disabled={busy} onClick={() => setMenuOpen((open) => !open)} title="More note actions" aria-label="More note actions" aria-expanded={menuOpen}><MoreHorizontal size={18} /></button>
@@ -197,7 +234,7 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
             <div className="repeat-control" ref={scheduleRef}>
               <button className="property-button" type="button" disabled={readOnly} onClick={openSchedule} aria-expanded={scheduleOpen}><Repeat2 size={13} />{schedule ? `${schedule.interval[0].toUpperCase() + schedule.interval.slice(1)} · ${schedule.dueAt}` : 'Repeat'}</button>
               {scheduleOpen && <form className="schedule-popover" onSubmit={saveSchedule}>
-                <strong>Recurring note</strong><p>Create the next note when you’re ready from Templates. Nothing runs in the background.</p>
+                <strong>Recurring note</strong><p>Create the next note from Templates, or turn on auto while Jot is open. Nothing runs when it is closed.</p>
                 <label>Repeat<select className="field" value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value as typeof scheduleInterval)}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="yearly">Yearly</option></select></label>
                 <label>Next date<input className="field" type="date" value={scheduleDate} onChange={(event) => setScheduleDate(event.target.value)} required /></label>
                 {scheduleError && <span className="dialog-error" role="alert">{scheduleError}</span>}
@@ -225,18 +262,35 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
             </div>}
           </div>
           {mode === 'write' ? <textarea ref={textareaRef} className="editor-textarea" aria-label="Note body in Markdown" value={note.body} onChange={(event) => onChange({ body: event.target.value })} placeholder="Start writing, or type [[ to link a note…" maxLength={1000000} readOnly={readOnly} spellCheck />
-            : <div className="markdown">{note.body.trim() ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+            : <div className="markdown">{note.body.trim() ? <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={(url) => url.startsWith('attachment:') ? url : defaultUrlTransform(url)} components={{
               a: ({ href, children, ...props }) => {
+                if (href?.startsWith('attachment:')) {
+                  const attachment = attachmentUrls[href.slice('attachment:'.length)];
+                  return attachment ? <a href={attachment.downloadUrl} download={attachment.name}>{children}</a> : <span title="Attachment unavailable">{children}</span>;
+                }
                 if (href?.startsWith('#jot-wiki-')) {
                   let target = '';
                   try { target = decodeURIComponent(href.slice('#jot-wiki-'.length)); } catch { target = ''; }
                   const matches = notes.filter((item) => item.id !== note.id && item.title.trim().toLocaleLowerCase() === target.trim().toLocaleLowerCase());
                   return <a href={href} title={matches.length === 1 ? `Open ${matches[0].title}` : matches.length ? 'Multiple notes have this title' : 'No matching note yet'} onClick={(event) => { event.preventDefault(); if (matches.length === 1) onOpenNote(matches[0].id); }}>{children}</a>;
                 }
-                return <a href={href} {...props} target={href?.startsWith('http') ? '_blank' : undefined} rel={href?.startsWith('http') ? 'noopener noreferrer' : undefined}>{children}</a>;
+                const external = !!href && /^(https?:)?\/\//i.test(href);
+                return <a href={href} {...props} target={external ? '_blank' : undefined} rel={external ? 'noopener noreferrer' : undefined} referrerPolicy={external ? 'no-referrer' : undefined}>{children}</a>;
+              },
+              img: ({ src, alt }) => {
+                const source = typeof src === 'string' ? src : '';
+                if (source.startsWith('attachment:')) {
+                  const attachment = attachmentUrls[source.slice('attachment:'.length)];
+                  const safeRaster = attachment?.imageUrl;
+                  return safeRaster ? <img src={safeRaster} alt={alt || attachment.name} /> : <span className="image-placeholder">Local image unavailable.</span>;
+                }
+                if (!isRemoteImageSource(source)) return <span className="image-placeholder">Image unavailable.</span>;
+                if (!canLoadRemoteImage(note.id, source, allowedRemoteImages)) return <span className="image-placeholder"><ImageOff size={14} /><span>{alt || 'External image'} · not loaded for privacy</span><button type="button" className="text-button" onClick={() => onAllowRemoteImage(remoteImageKey(note.id, source))}>Load external image</button></span>;
+                return <img src={source} alt={alt || ''} referrerPolicy="no-referrer" loading="lazy" decoding="async" />;
               },
             }}>{renderWikiLinks(note.body)}</ReactMarkdown> : <p className="empty-body">Nothing here yet. Switch to Write to add your thoughts.</p>}</div>}
-          <AttachmentList noteId={note.id} listAttachments={listAttachments} addAttachment={readOnly ? undefined : addAttachment} deleteAttachment={readOnly ? undefined : deleteAttachment} onAppendText={readOnly ? undefined : onAppendText} />
+          {!note.body.trim() && mode === 'write' && <p className="editor-empty-hint">Markdown is supported. Use <code>[[note title]]</code> to link a note or <code>- [ ]</code> to add a task.</p>}
+          <AttachmentList noteId={note.id} listAttachments={listAttachments} addAttachment={readOnly ? undefined : addFile} deleteAttachment={readOnly ? undefined : deleteFile} onAppendText={readOnly ? undefined : onAppendText} refreshKey={attachmentVersion} />
           <section className="document-footer" aria-label="Note connections">
             <div className="document-footer-heading"><Link2 size={14} /> Connections</div>
             {backlinks.length === 0 && related.length === 0 && outgoing.length === 0 ? <p>No connections yet. Link another note with <code>[[note title]]</code>.</p> : <>
@@ -245,6 +299,7 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
               {unresolved.length > 0 && <p>{unresolved.map(({ link, matches }) => `${link.title} (${matches.length ? 'multiple matches' : 'not found'})`).join(' · ')}</p>}
             </>}
           </section>
+          <div className="editor-shortcuts"><span>Markdown supported</span><span><kbd>{modifier}</kbd> <kbd>K</kbd> Search</span><span><kbd>{modifier}</kbd> <kbd>N</kbd> New note</span></div>
         </article>
       </div>
     </main>

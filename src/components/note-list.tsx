@@ -3,6 +3,7 @@
 import { FileText, PanelLeft, Plus, Search } from 'lucide-react';
 import type { Note, Notebook } from '@/lib/types';
 import { noteSnippet } from '@/lib/features';
+import { useShortcutModifier } from './use-shortcut-modifier';
 
 type Props = {
   title: string;
@@ -27,6 +28,7 @@ function noteDate(value: string) {
 }
 
 export function NoteList({ title, notes, notebooks, selectedId, onSelect, onNew, onSearch, onOpenSidebar }: Props) {
+  const modifier = useShortcutModifier();
   const sorted = [...notes].sort((a, b) => Number(b.pinned) - Number(a.pinned) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   return <section className="note-list" aria-label={`${title} note list`}>
     <div className="list-header">
@@ -37,7 +39,7 @@ export function NoteList({ title, notes, notebooks, selectedId, onSelect, onNew,
       </div>
       <div className="list-meta">{notes.length} {notes.length === 1 ? 'note' : 'notes'}</div>
     </div>
-    <div className="list-toolbar"><button className="list-search" onClick={onSearch}><Search size={14} /><span>Find a note</span><span className="shortcut">⌘ K</span></button></div>
+    <div className="list-toolbar"><button className="list-search" onClick={onSearch}><Search size={14} /><span>Find a note</span><span className="shortcut">{modifier} K</span></button></div>
     <div className="note-list-items">
       {sorted.length > 0 ? <>
         <div className="note-list-section">Recently edited</div>

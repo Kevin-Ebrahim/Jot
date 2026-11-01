@@ -93,7 +93,7 @@ export function useJot() {
   }, []);
   const resolve = useCallback((id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number) => run(() => resolveConflict(id, choice, expectedRevision, expectedServerVersion)), [run]);
 
-  return { notes, notebooks, isLoading, error, saveState, workspaceId, syncStatus, refresh,
+  return { notes, notebooks, isLoading, error, saveState, workspaceId, syncStatus, refresh, getCurrentWorkspaceId: getWorkspaceId,
     clearError: () => setError(null),
     listNotes: jotStore.listNotes, getNote: jotStore.getNote, listNotebooks: jotStore.listNotebooks,
     createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox, createNotebook, renameNotebook, deleteNotebook,
