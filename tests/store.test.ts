@@ -77,3 +77,113 @@ test('markdown ZIP contains readable notes and their actual attachments', async 
   assert.ok(attachment);
   assert.equal(await zip.file(attachment)!.async('text'), 'test bytes');
 });
+
+test('recurrence advances the source and creates exactly one occurrence under concurrent clicks', async () => {
+  await switchWorkspace(unique());
+  const source = await jotStore.createNote({ title: 'Weekly', body: 'next: 2026-11-01' });
+  const attempts = await Promise.allSettled([
+    jotStore.createRecurringOccurrence(source.id, source.revision, 'next: 2026-11-08', { title: 'Weekly 1', body: 'one' }, `${source.id}:2026-11-01`),
+    jotStore.createRecurringOccurrence(source.id, source.revision, 'next: 2026-11-08', { title: 'Weekly 1', body: 'one' }, `${source.id}:2026-11-01`),
+  ]);
+  assert.equal(attempts.filter(item => item.status === 'fulfilled').length, 1);
+  assert.equal(attempts.filter(item => item.status === 'rejected').length, 1);
+  assert.equal((await jotStore.listNotes()).length, 2);
+  assert.equal((await jotStore.getNote(source.id))?.body, 'next: 2026-11-08');
+});
+
+test('a delayed backup file cannot import into a workspace selected meanwhile', async () => {
+  const source = unique(), destination = unique(), other = unique();
+  await switchWorkspace(source); await jotStore.createNote({ title: 'Private export' });
+  const original = await jotStore.exportBackup();
+  let release!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const reading = new Promise<void>(resolve => { started = resolve; });
+  const delayed = new Blob([await original.text()], { type: 'application/json' });
+  Object.defineProperty(delayed, 'text', { value: async () => { started(); await gate; return original.text(); } });
+  await switchWorkspace(destination);
+  const pending = jotStore.importBackup(delayed);
+  await reading;
+  await switchWorkspace(other);
+  release();
+  await assert.rejects(pending, /workspace changed/i);
+  assert.equal((await jotStore.listNotes()).length, 0);
+  await switchWorkspace(destination);
+  assert.equal((await jotStore.listNotes()).length, 0);
+});
+
+test('a delayed decrypt cannot import into a newly selected account', async () => {
+  const source = unique(), destination = unique(), other = unique();
+  await switchWorkspace(source); await jotStore.createNote({ title: 'Encrypted private data' });
+  const backup = await jotStore.exportBackup('a secure password');
+  await switchWorkspace(destination);
+  let release!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const deriving = new Promise<void>(resolve => { started = resolve; });
+  const subtle = crypto.subtle;
+  const original = subtle.deriveKey.bind(subtle);
+  Object.defineProperty(subtle, 'deriveKey', { configurable: true, value: async (...args: Parameters<SubtleCrypto['deriveKey']>) => {
+    started(); await gate; return original(...args);
+  } });
+  try {
+    const pending = jotStore.importBackup(backup, 'a secure password');
+    await deriving;
+    await switchWorkspace(other);
+    release();
+    await assert.rejects(pending, /workspace changed/i);
+    assert.equal((await jotStore.listNotes()).length, 0);
+    await switchWorkspace(destination);
+    assert.equal((await jotStore.listNotes()).length, 0);
+  } finally { delete (subtle as unknown as { deriveKey?: unknown }).deriveKey; }
+});
+
+test('deleted attachment bytes never appear in plaintext, encrypted, or Markdown ZIP exports', async () => {
+  await switchWorkspace(unique());
+  const note = await jotStore.createNote({ title: 'Sensitive' });
+  const attachment = await jotStore.addAttachment(note.id, new Blob(['secret-attachment-bytes']), 'secret.txt');
+  const db = await (await import('../src/lib/store')).getWorkspaceDb();
+  await db.put('attachments', { ...attachment, serverVersion: 1, syncState: 'synced' });
+  await jotStore.deleteAttachment(attachment.id);
+  assert.equal((await jotStore.listAttachments(note.id)).length, 0);
+  const tombstone = await db.get('attachments', attachment.id);
+  assert.ok(tombstone?.deletedAt);
+  assert.equal(tombstone.blob.size, 0);
+  const plain = JSON.parse(await (await jotStore.exportBackup()).text());
+  assert.equal(plain.attachments.length, 0);
+  assert.equal(JSON.stringify(plain).includes('secret-attachment-bytes'), false);
+  const encrypted = await jotStore.exportBackup('strong secret password');
+  await switchWorkspace(unique());
+  await jotStore.importBackup(encrypted, 'strong secret password');
+  const restored = (await jotStore.listNotes())[0];
+  assert.equal((await jotStore.listAttachments(restored.id)).length, 0);
+  await switchWorkspace(unique());
+  const zipNote = await jotStore.createNote({ title: 'ZIP sensitive' });
+  const zipAttachment = await jotStore.addAttachment(zipNote.id, new Blob(['zip-secret-bytes']), 'deleted.txt');
+  const zipDb = await (await import('../src/lib/store')).getWorkspaceDb();
+  await zipDb.put('attachments', { ...zipAttachment, serverVersion: 1, syncState: 'synced' });
+  await jotStore.deleteAttachment(zipAttachment.id);
+  const zip = await JSZip.loadAsync(await (await jotStore.exportMarkdownZip()).arrayBuffer());
+  assert.equal(Object.keys(zip.files).some(path => path.includes('deleted.txt')), false);
+  for (const file of Object.values(zip.files)) if (!file.dir) assert.equal((await file.async('text')).includes('zip-secret-bytes'), false);
+});
+
+test('backup size checks UTF-8 bytes rather than JavaScript character count', async () => {
+  const { assertBackupSize } = await import('../src/lib/store');
+  const unicode = new Blob(['漢字']);
+  assert.equal(unicode.size, 6);
+  assert.throws(() => assertBackupSize(unicode, 5), /exceeds/i);
+  assert.doesNotThrow(() => assertBackupSize(unicode, 6));
+});
+
+test('backup import rejects noncanonical dates and blank tags atomically', async () => {
+  await switchWorkspace(unique());
+  await jotStore.createNote({ title: 'Source', tags: ['valid'] });
+  const baseline = JSON.parse(await (await jotStore.exportBackup()).text());
+  await switchWorkspace(unique());
+  const badDate = structuredClone(baseline); badDate.notes[0].updatedAt = '2020-01-01';
+  await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(badDate)])), /invalid note/i);
+  const badTag = structuredClone(baseline); badTag.notes[0].tags = ['   '];
+  await assert.rejects(jotStore.importBackup(new Blob([JSON.stringify(badTag)])), /invalid note/i);
+  assert.equal((await jotStore.listNotes()).length, 0);
+});

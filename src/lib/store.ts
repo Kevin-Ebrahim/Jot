@@ -228,6 +228,99 @@ async function updateNote(id: string, patch: NotePatch, expectedRevision: number
 async function trashNote(id: string, expectedRevision: number): Promise<Note> { return changeNote(id, expectedRevision, {}, now()); }
 async function restoreNote(id: string, expectedRevision: number): Promise<Note> { return changeNote(id, expectedRevision, {}, null); }
 
+/** Stable ID prevents two offline devices from silently creating the same scheduled occurrence. */
+async function occurrenceId(sourceId: string, occurrenceKey: string): Promise<string> {
+  const prefix = `${sourceId}:`;
+  if (!occurrenceKey.startsWith(prefix) || !/^\d{4}-\d{2}-\d{2}$/.test(occurrenceKey.slice(prefix.length))) {
+    throw new Error('A valid recurring occurrence date is required.');
+  }
+  if (!globalThis.crypto?.subtle) throw new Error('Recurring notes require HTTPS or localhost with Web Crypto.');
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`jot-occurrence-v1\0${occurrenceKey}`)));
+  const bytes = hash.slice(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x80; // UUIDv8: application-defined SHA-256 name-based ID
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+/** Advance the source marker and create an occurrence together, or do neither. */
+async function createRecurringOccurrence(sourceId: string, expectedRevision: number, sourceBody: string, newInput: NewNote, occurrenceKey: string): Promise<Note> {
+  const workspace = getWorkspaceId();
+  const generatedId = await occurrenceId(sourceId, occurrenceKey);
+  if (workspace !== getWorkspaceId()) throw new Error('Workspace changed; occurrence was not created.');
+  const sourcePatch = validNotePatch({ body: sourceBody });
+  const input = validNotePatch(newInput);
+  const timestamp = now();
+  const db = await getWorkspaceDb(workspace);
+  const tx = db.transaction(['notes', 'notebooks'], 'readwrite');
+  const notes = tx.objectStore('notes');
+  const source = await notes.get(sourceId);
+  if (!source || source.deletedAt) throw new Error('The recurring note no longer exists.');
+  requireEditable(source.role);
+  if (source.revision !== expectedRevision) throw new ConflictError(source);
+  const targetId = input.notebookId === undefined ? source.notebookId : input.notebookId;
+  let targetRole: AccessRole = 'owner';
+  if (targetId) {
+    const notebook = await tx.objectStore('notebooks').get(targetId);
+    if (!notebook || notebook.deletedAt) throw new Error('The destination notebook no longer exists.');
+    requireEditable(notebook.role);
+    targetRole = notebook.role;
+  }
+  const occurrence: Note = { id: generatedId, title: input.title ?? source.title, body: input.body ?? '',
+    tags: input.tags ?? [...source.tags], notebookId: targetId, pinned: input.pinned ?? false,
+    createdAt: timestamp, updatedAt: timestamp, deletedAt: null, revision: 1, serverVersion: null,
+    syncState: stateForNew(workspace), role: targetRole };
+  const advanced: Note = { ...source, body: sourcePatch.body!, updatedAt: timestamp, revision: source.revision + 1,
+    syncState: stateForWrite(source.syncState, workspace) };
+  await notes.put(advanced); await notes.add(occurrence); await tx.done;
+  notifyStoreChanged(workspace);
+  return occurrence;
+}
+
+/** Explicit recovery after access loss; never silently re-upload the shared source. */
+async function copyUnavailableNoteToInbox(sourceId: string, expectedRevision: number, draftPatch: NotePatch = {}): Promise<Note> {
+  const workspace = getWorkspaceId();
+  if (!workspace) throw new Error('Recovery requires an account workspace.');
+  const patch = validNotePatch(draftPatch);
+  if (patch.notebookId !== undefined) throw new Error('Recovered notes must be copied to Inbox.');
+  if (!globalThis.crypto?.subtle) throw new Error('Recovery requires HTTPS or localhost with Web Crypto.');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(patch))));
+  const fingerprint = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; recovery was cancelled.');
+  const db = await getWorkspaceDb(workspace);
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; recovery was cancelled.');
+  const tx = db.transaction(['notes', 'attachments', 'imports'], 'readwrite');
+  const notes = tx.objectStore('notes');
+  const source = await notes.get(sourceId);
+  if (!source || source.revision !== expectedRevision) {
+    if (source) throw new ConflictError(source);
+    throw new Error('That local note no longer exists.');
+  }
+  if (source.role !== 'viewer' || source.syncState !== 'local') throw new Error('This note does not need access recovery.');
+  const key = `recovery:${source.id}:${source.revision}:${fingerprint}`;
+  const previous = await tx.objectStore('imports').get(key);
+  if (previous) {
+    const copy = await notes.get(previous.targetId);
+    if (copy && !copy.deletedAt) { await tx.done; return copy; }
+  }
+  const id = uuid(), timestamp = now();
+  let body = patch.body ?? source.body;
+  const attachments = tx.objectStore('attachments');
+  const files = await attachments.index('by-note').getAll(source.id);
+  for (const file of files.filter(item => !item.deletedAt)) {
+    const newId = uuid();
+    body = body.split(`attachment:${file.id}`).join(`attachment:${newId}`);
+    await attachments.add({ ...file, id: newId, noteId: id, serverVersion: null, syncState: 'dirty', deletedAt: null });
+  }
+  const copy: Note = { ...source, ...patch, id, body, title: `${(patch.title ?? source.title) || 'Untitled'} (recovered copy)`.slice(0, 300),
+    notebookId: null, createdAt: timestamp, updatedAt: timestamp, deletedAt: null, revision: 1,
+    serverVersion: null, syncState: 'dirty', role: 'owner' };
+  await notes.add(copy);
+  await tx.objectStore('imports').put({ key, targetId: copy.id });
+  await tx.done;
+  notifyStoreChanged(workspace);
+  return copy;
+}
+
 async function listNotebooks(): Promise<Notebook[]> {
   return (await (await getWorkspaceDb()).getAll('notebooks')).filter(n => !n.deletedAt).sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -305,7 +398,7 @@ async function deleteAttachment(id: string): Promise<void> {
   const note = await tx.objectStore('notes').get(attachment.noteId);
   if (note) requireEditable(note.role);
   if (workspace === null) await attachments.delete(id);
-  else await attachments.put({ ...attachment, deletedAt: now(), syncState: 'dirty' });
+  else await attachments.put({ ...attachment, blob: new Blob([], { type: 'application/octet-stream' }), deletedAt: now(), syncState: 'dirty' });
   await tx.done;
   notifyStoreChanged(workspace);
 }
@@ -339,7 +432,8 @@ async function snapshotWorkspace(workspace: string | null): Promise<{ notes: Not
     tx.objectStore('notes').getAll(), tx.objectStore('notebooks').getAll(), tx.objectStore('attachments').getAll(),
   ]);
   await tx.done;
-  return { notes, notebooks, attachments };
+  // A deleted attachment is a sync tombstone, not backup content. Never export its bytes.
+  return { notes, notebooks, attachments: attachments.filter(attachment => !attachment.deletedAt) };
 }
 async function makeBackup(workspace: string | null): Promise<BackupFile> {
   const snapshot = await snapshotWorkspace(workspace);
@@ -387,17 +481,22 @@ async function decryptBackup(value: EncryptedBackup, password?: string): Promise
   } catch { throw new Error('Could not decrypt backup. Check the password and that the file is intact.'); }
 }
 async function exportBackup(password?: string): Promise<Blob> {
-  const plain = JSON.stringify(await makeBackup(getWorkspaceId()));
+  const workspace = getWorkspaceId();
+  const plain = JSON.stringify(await makeBackup(workspace));
   const result = password ? JSON.stringify(await encryptBackup(plain, password)) : plain;
-  if (result.length > BACKUP_LIMIT) throw new Error('Backup exceeds the 150 MB import limit; export smaller workspaces separately.');
-  return new Blob([result], { type: 'application/json' });
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; backup was not exported.');
+  const blob = new Blob([result], { type: 'application/json' });
+  assertBackupSize(blob);
+  return blob;
 }
 function safeFilename(name: string): string {
   return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '-').replace(/^\.+/, '').trim().slice(0, 100) || 'Untitled';
 }
 async function exportMarkdownZip(): Promise<Blob> {
+  const workspace = getWorkspaceId();
   const JSZip = (await import('jszip')).default;
-  const snapshot = await snapshotWorkspace(getWorkspaceId());
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; export was cancelled.');
+  const snapshot = await snapshotWorkspace(workspace);
   const zip = new JSZip();
   const attachmentPaths = new Map<string, string>();
   for (const attachment of snapshot.attachments) {
@@ -414,14 +513,22 @@ async function exportMarkdownZip(): Promise<Blob> {
   }
   zip.file('manifest.json', JSON.stringify({ format: 'jot-markdown-export', version: 1, exportedAt: now(),
     notebooks: snapshot.notebooks, notes: snapshot.notes.map(({ body: _body, ...metadata }) => metadata) }, null, 2));
-  return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+  const result = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; export was cancelled.');
+  return result;
 }
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 200; }
-function validDate(value: unknown): value is string { return typeof value === 'string' && value.length <= 100 && Number.isFinite(Date.parse(value)); }
+function validDate(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 32 && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) && Number.isFinite(Date.parse(value));
+}
+/** Check actual UTF-8 bytes, not UTF-16 JavaScript string length. */
+export function assertBackupSize(blob: Blob, limit = BACKUP_LIMIT): void {
+  if (blob.size > limit) throw new Error('Backup exceeds the 150 MB import limit; export smaller workspaces separately.');
+}
 function validateBackup(value: unknown): BackupFile {
   if (!plainObject(value) || value.format !== 'jot-backup' || value.version !== 1 || !validDate(value.exportedAt) ||
       !Array.isArray(value.notes) || !Array.isArray(value.notebooks) || !Array.isArray(value.attachments) ||
@@ -438,7 +545,7 @@ function validateBackup(value: unknown): BackupFile {
   for (const note of value.notes) {
     if (!plainObject(note) || !validId(note.id) || noteIds.has(note.id) || typeof note.title !== 'string' || note.title.length > 300 ||
         typeof note.body !== 'string' || note.body.length > 1_000_000 || !Array.isArray(note.tags) || note.tags.length > 50 ||
-        note.tags.some(tag => typeof tag !== 'string' || tag.length > 80) ||
+        note.tags.some(tag => typeof tag !== 'string' || !tag.trim() || tag.length > 80) ||
         !(note.notebookId === null || (validId(note.notebookId) && notebookIds.has(note.notebookId))) ||
         !validDate(note.createdAt) || !validDate(note.updatedAt) || !(note.deletedAt === null || validDate(note.deletedAt)) ||
         typeof note.pinned !== 'boolean') throw new Error('Invalid note in backup.');
@@ -481,7 +588,9 @@ async function mergeBackup(value: BackupFile, workspace: string | null): Promise
       pinned: note.pinned, createdAt: note.createdAt, updatedAt: note.updatedAt, deletedAt: note.deletedAt,
       revision: 1, serverVersion: null, syncState: stateForNew(workspace), role: 'owner' };
   });
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; import was cancelled.');
   const db = await getWorkspaceDb(workspace);
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; import was cancelled.');
   const tx = db.transaction(['notes', 'notebooks', 'attachments'], 'readwrite');
   for (const notebook of notebooks) await tx.objectStore('notebooks').add(notebook);
   for (const note of notes) await tx.objectStore('notes').add(note);
@@ -491,6 +600,7 @@ async function mergeBackup(value: BackupFile, workspace: string | null): Promise
   return notes.length;
 }
 async function importBackup(file: Blob, password?: string): Promise<void> {
+  const workspace = getWorkspaceId();
   if (!(file instanceof Blob) || file.size > BACKUP_LIMIT) throw new Error('Choose a Jot backup smaller than 150 MB.');
   let value: unknown;
   try { value = JSON.parse(await file.text()); } catch { throw new Error('Backup is not valid JSON.'); }
@@ -498,12 +608,15 @@ async function importBackup(file: Blob, password?: string): Promise<void> {
     const plaintext = await decryptBackup(value as unknown as EncryptedBackup, password);
     try { value = JSON.parse(plaintext); } catch { throw new Error('Decrypted backup is not valid JSON.'); }
   }
-  await mergeBackup(validateBackup(value), getWorkspaceId());
+  if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; import was cancelled.');
+  await mergeBackup(validateBackup(value), workspace);
 }
 async function copyGuestNotesToAccount(userId: string): Promise<number> {
   if (!userId || getWorkspaceId() !== userId) throw new Error('Switch to the matching signed-in account before copying guest notes.');
   const source = await snapshotWorkspace(null);
+  if (getWorkspaceId() !== userId) throw new Error('Workspace changed; guest copy was cancelled.');
   const db = await getWorkspaceDb(userId);
+  if (getWorkspaceId() !== userId) throw new Error('Workspace changed; guest copy was cancelled.');
   // The import ledger and copied records commit together. Readwrite transactions over
   // these stores serialize concurrent clicks and prevent duplicate imports.
   const tx = db.transaction(['notes', 'notebooks', 'attachments', 'imports'], 'readwrite');
@@ -552,7 +665,7 @@ async function copyGuestNotesToAccount(userId: string): Promise<number> {
 }
 
 export const jotStore = {
-  listNotes, getNote, createNote, updateNote, trashNote, restoreNote,
+  listNotes, getNote, createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox,
   listNotebooks, createNotebook, renameNotebook, deleteNotebook,
   listAttachments, addAttachment, deleteAttachment,
   exportBackup, importBackup, exportMarkdownZip, switchWorkspace, copyGuestNotesToAccount,

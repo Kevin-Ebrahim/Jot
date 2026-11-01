@@ -16,7 +16,7 @@ export async function listConflicts(): Promise<SyncConflict[]> {
 }
 
 /** The choice is explicit: never discard either side during automatic reconciliation. */
-export async function resolveConflict(id: string, choice: 'local' | 'server' | 'both', expectedRevision: number): Promise<void> {
+export async function resolveConflict(id: string, choice: 'local' | 'server' | 'both', expectedRevision: number, expectedServerVersion: number): Promise<void> {
   const workspace = getWorkspaceId();
   if (!workspace) throw new Error('Conflicts can only be resolved in an account workspace.');
   const db = await getWorkspaceDb(workspace);
@@ -24,6 +24,7 @@ export async function resolveConflict(id: string, choice: 'local' | 'server' | '
   const conflicts = tx.objectStore('conflicts');
   const conflict = await conflicts.get(id);
   if (!conflict) throw new Error('That conflict has already been resolved.');
+  if (conflict.serverVersion !== expectedServerVersion) throw new Error('The server version changed since review. Refresh the conflict before choosing.');
   const table = conflict.entity === 'note' ? tx.objectStore('notes') : tx.objectStore('notebooks');
   const current = await table.get(conflict.entityId) as Note | Notebook | undefined;
   if (!current) throw new Error('The local item no longer exists.');
@@ -61,6 +62,15 @@ export async function resolveConflict(id: string, choice: 'local' | 'server' | '
       }
     }
     if (conflict.entity === 'note') {
+      // Server wins on the original note. Unsent additions and local deletion
+      // tombstones belong to the discarded draft: leaving them dirty would
+      // upload/delete files after the user explicitly chose the server version.
+      // For 'both', live local files were already copied to the new note above.
+      const attachments = tx.objectStore('attachments');
+      const localAttachments = await attachments.index('by-note').getAll(current.id);
+      for (const attachment of localAttachments) {
+        if (attachment.serverVersion === null || attachment.syncState !== 'synced') await attachments.delete(attachment.id);
+      }
       const remote: Note = { ...conflict.server as ServerNote, revision: current.revision + 1,
         serverVersion: conflict.serverVersion, syncState: 'synced', role: conflict.role };
       await tx.objectStore('notes').put(remote);
@@ -88,6 +98,8 @@ class SyncHttpError extends Error {
   constructor(public status: number, message: string, public payload: Record<string, unknown> = {}) { super(message); }
 }
 const active = new Map<string, Promise<SyncResult>>();
+const controllers = new Map<string, AbortController>();
+const SYNC_TIMEOUT_MS = 20_000;
 const validRole = (role: unknown): role is AccessRole => role === 'owner' || role === 'editor' || role === 'viewer';
 const validId = (id: unknown): id is string => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 const validDate = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
@@ -121,9 +133,11 @@ function localData(kind: SyncEntity, remote: Envelope, revision: number): Entity
 }
 async function request(workspace: string, path: string, init: RequestInit = {}): Promise<Response> {
   if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; sync paused.');
+  const signal = controllers.get(workspace)?.signal;
+  if (signal?.aborted) throw new Error('Sync timed out; pending changes remain on this device.');
   const headers = new Headers(init.headers);
   headers.set('X-Jot-Workspace', workspace);
-  return fetch(path, { ...init, headers, credentials: 'same-origin', cache: 'no-store' });
+  return fetch(path, { ...init, headers, signal, credentials: 'same-origin', cache: 'no-store' });
 }
 async function responseJson(response: Response): Promise<Record<string, unknown>> {
   let data: unknown;
@@ -154,6 +168,11 @@ async function recordConflict(workspace: string, kind: SyncEntity, id: string, r
   const current = await store.get(id) as Entity | undefined;
   if (!current) { await tx.done; return false; }
   if (pendingOperationId && !await tx.objectStore('outbox').get(pendingOperationId)) { await tx.done; return false; }
+  const previous = await tx.objectStore('conflicts').get(`${kind}:${id}`);
+  if (previous && previous.serverVersion > remote.version) {
+    if (pendingOperationId) await tx.objectStore('outbox').delete(pendingOperationId);
+    await tx.done; return false;
+  }
   const conflict: SyncConflict = { id: `${kind}:${id}`, entity: kind, entityId: id, local: current,
     server: remote.data, serverVersion: remote.version, role: remote.role, detectedAt: new Date().toISOString() };
   await tx.objectStore('conflicts').put(conflict);
@@ -180,6 +199,38 @@ async function acknowledge(workspace: string, operation: OutboxChange, remote: E
   await tx.done;
   notifyStoreChanged(workspace);
 }
+/** A denied previously-synced item stays as a local, read-only copy; never re-upload it under a new identity. */
+async function retireUnavailable(workspace: string, operation: OutboxChange): Promise<void> {
+  const db = await getWorkspaceDb(workspace);
+  const tx = db.transaction([operation.entity === 'note' ? 'notes' : 'notebooks', 'outbox'], 'readwrite');
+  const outbox = tx.objectStore('outbox');
+  if (!await outbox.get(operation.operationId)) { await tx.done; return; }
+  const store = operation.entity === 'note' ? tx.objectStore('notes') : tx.objectStore('notebooks');
+  const current = await store.get(operation.entityId) as Entity | undefined;
+  if (current) await store.put({ ...current, syncState: 'local', role: 'viewer' } as Note & Notebook);
+  await outbox.delete(operation.operationId);
+  await tx.done;
+  notifyStoreChanged(workspace);
+}
+async function handleAccessFailure(workspace: string, operation: OutboxChange, result: SyncResult): Promise<boolean> {
+  const kind = operation.entity;
+  const path = `/api/${kind === 'note' ? 'notes' : 'notebooks'}`;
+  try {
+    const data = await responseJson(await request(workspace, path));
+    const raw = data[kind === 'note' ? 'notes' : 'notebooks'];
+    if (!Array.isArray(raw)) return false;
+    const records = raw.map(item => envelope(kind, item));
+    const remote = records.find(item => item.data.id === operation.entityId);
+    if (remote) {
+      if (await recordConflict(workspace, kind, operation.entityId, remote, operation.operationId)) result.conflicts += 1;
+      return true;
+    }
+    await retireUnavailable(workspace, operation);
+    addError(result, `Access to this ${kind} or its destination was removed; your unsynced local copy was kept and will not be uploaded.`);
+    return true;
+  } catch { /* Network/session errors are inconclusive; retain the original operation for retry. */ }
+  return false;
+}
 async function sendOperation(workspace: string, csrf: string, operation: OutboxChange, result: SyncResult): Promise<void> {
   const kind = operation.entity;
   const path = `/api/${kind === 'note' ? 'notes' : 'notebooks'}/${encodeURIComponent(operation.entityId)}`;
@@ -203,6 +254,8 @@ async function sendOperation(workspace: string, csrf: string, operation: OutboxC
         return;
       }
     }
+    if (cause instanceof SyncHttpError && (cause.status === 403 || cause.status === 404) &&
+        !/csrf|origin/i.test(cause.message) && await handleAccessFailure(workspace, operation, result)) return;
     addError(result, `${kind === 'note' ? 'Note' : 'Notebook'} could not sync: ${cause instanceof Error ? cause.message : 'network error'}`);
     // The exact immutable operation stays in the outbox for a safe idempotent retry.
   }
@@ -222,6 +275,8 @@ async function reconcile(workspace: string, kind: SyncEntity, remote: Envelope):
   const changedRemote = current.serverVersion !== remote.version;
   const unsynced = current.syncState === 'dirty' || current.syncState === 'conflict' || current.syncState === 'local';
   if ((changedRemote && unsynced) || (remote.role === 'viewer' && unsynced)) {
+    const previous = await tx.objectStore('conflicts').get(`${kind}:${current.id}`);
+    if (previous && previous.serverVersion > remote.version) { await tx.done; return 'unchanged'; }
     const conflict: SyncConflict = { id: `${kind}:${current.id}`, entity: kind, entityId: current.id, local: current,
       server: remote.data, serverVersion: remote.version, role: remote.role, detectedAt: new Date().toISOString() };
     await tx.objectStore('conflicts').put(conflict);
@@ -295,6 +350,7 @@ async function syncAttachments(workspace: string, csrf: string, result: SyncResu
   // A conflicted/dirty note must not leak attachments from its unresolved draft.
   const notes = (await db.getAll('notes')).filter(note => note.serverVersion !== null && note.syncState === 'synced');
   for (const note of notes) {
+    if (controllers.get(workspace)?.signal.aborted) break;
     try {
       const prefix = `/api/notes/${encodeURIComponent(note.id)}/attachments`;
       const list = await responseJson(await request(workspace, prefix));
@@ -332,7 +388,7 @@ async function syncAttachments(workspace: string, csrf: string, result: SyncResu
             const tx = db.transaction('attachments', 'readwrite');
             const latest = await tx.store.get(item.id);
             if (latest && !latest.deletedAt && latest.serverVersion !== null) {
-              await tx.store.put({ ...latest, deletedAt: server.deletedAt, serverVersion: 2, syncState: 'synced' });
+              await tx.store.put({ ...latest, blob: new Blob([], { type: 'application/octet-stream' }), deletedAt: server.deletedAt, serverVersion: 2, syncState: 'synced' });
             }
             await tx.done;
             notifyStoreChanged(workspace);
@@ -375,7 +431,7 @@ function orderOutbox(a: OutboxChange, b: OutboxChange): number {
 }
 async function performSync(workspace: string): Promise<SyncResult> {
   const result: SyncResult = { pushed: 0, pulled: 0, conflicts: 0, errors: [] };
-  const sessionResponse = await fetch('/api/auth/session', { credentials: 'same-origin', cache: 'no-store' });
+  const sessionResponse = await request(workspace, '/api/auth/session');
   const session = await responseJson(sessionResponse);
   if (!object(session.user) || session.user.id !== workspace || typeof session.csrfToken !== 'string' || !session.csrfToken) {
     throw new Error('Sign in to the matching account before syncing this workspace.');
@@ -385,7 +441,10 @@ async function performSync(workspace: string): Promise<SyncResult> {
   // Replay the exact durable operation before pulling; a lost response may have
   // already committed on the server, where the operation receipt makes it safe.
   const pending = (await db.getAll('outbox')).sort(orderOutbox);
-  for (const operation of pending) await sendOperation(workspace, csrf, operation, result);
+  for (const operation of pending) {
+    if (controllers.get(workspace)?.signal.aborted) break;
+    await sendOperation(workspace, csrf, operation, result);
+  }
   try { await pull(workspace, result); }
   catch (cause) { addError(result, `Could not read the server workspace: ${cause instanceof Error ? cause.message : 'network error'}`); return result; }
   const notebooks = await db.getAll('notebooks');
@@ -398,6 +457,7 @@ async function performSync(workspace: string): Promise<SyncResult> {
     ...notebooks.filter(item => item.syncState === 'dirty' && !!item.deletedAt).map(item => ({ kind: 'notebook' as const, id: item.id })),
   ];
   for (const candidate of candidates) {
+    if (controllers.get(workspace)?.signal.aborted) break;
     const operation = await queueOperation(workspace, candidate.kind, candidate.id);
     if (operation) await sendOperation(workspace, csrf, operation, result);
   }
@@ -421,7 +481,14 @@ export function syncWorkspace(): Promise<SyncResult> {
   if (!workspace) return Promise.reject(new Error('Sign in before syncing.'));
   const existing = active.get(workspace);
   if (existing) return existing;
-  const job = performSync(workspace).finally(() => { if (active.get(workspace) === job) active.delete(workspace); });
+  const controller = new AbortController();
+  controllers.set(workspace, controller);
+  const timer = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
+  const job = performSync(workspace).finally(() => {
+    clearTimeout(timer);
+    if (controllers.get(workspace) === controller) controllers.delete(workspace);
+    if (active.get(workspace) === job) active.delete(workspace);
+  });
   active.set(workspace, job);
   return job;
 }
