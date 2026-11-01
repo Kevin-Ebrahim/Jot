@@ -67,7 +67,9 @@ export function ConflictList({ active }: { active: boolean }) {
       const message = messageForError(caught);
       await load();
       setChoice(null);
-      setError(`${message} Review the current versions and try again.`);
+      setError(/unsaved|save every draft/i.test(message)
+        ? `${message} Return to the note and resolve or preserve its visible draft before reviewing this conflict.`
+        : `${message} Review the current versions and try again.`);
     } finally { setBusy(false); }
   }
 

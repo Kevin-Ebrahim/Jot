@@ -91,6 +91,7 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
         <div className="collab-stack">
           <div className="collab-alert" role="alert"><CloudOff size={17} aria-hidden="true" /><span>{account.sessionError || 'Your session could not be checked.'}</span></div>
           <p className="collab-copy">You can keep working in the local workspace already on this device. Sync and sharing are paused until the session is confirmed.</p>
+          {account.sessionError && /unsaved|save every draft/i.test(account.sessionError) && <p className="collab-copy">Close this dialog and resolve or preserve the visible draft in its note before checking the session again.</p>}
           <button type="button" className="collab-button" onClick={checkSession} disabled={!!busy}>
             <RefreshCw size={15} aria-hidden="true" /> {busy === 'refresh' ? 'Checking…' : 'Check session again'}
           </button>
