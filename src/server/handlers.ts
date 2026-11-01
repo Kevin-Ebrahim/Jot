@@ -8,7 +8,9 @@ type Kind = 'note' | 'notebook';
 export function list(kind: Kind, req: Request): Promise<Response> {
   return route(() => {
     const db = getDatabase(); const current = requireSession(db, req); const repo = new Repository(db);
-    return kind === 'note' ? json({ notes: repo.listNotes(current.user.id) }) : json({ notebooks: repo.listNotebooks(current.user.id) });
+    // The client may infer revoked access only from an explicitly complete
+    // snapshot, never from an error or a malformed/partial response.
+    return kind === 'note' ? json({ notes: repo.listNotes(current.user.id), complete: true }) : json({ notebooks: repo.listNotebooks(current.user.id), complete: true });
   });
 }
 export function put(kind: Kind, req: Request, rawId: string): Promise<Response> {

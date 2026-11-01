@@ -1,7 +1,7 @@
 'use client';
 
 import { memo, useEffect, useMemo, useState } from 'react';
-import { FileText, PanelLeft, Plus, Search } from 'lucide-react';
+import { CloudOff, FileText, PanelLeft, Plus, Search } from 'lucide-react';
 import type { Note, Notebook } from '@/lib/types';
 import { noteSnippet } from '@/lib/features';
 import { NOTE_PAGE_SIZE, noteListPage, sortNotes } from './note-derivations';
@@ -17,6 +17,8 @@ type Props = {
   onNew: () => void;
   onSearch: () => void;
   onOpenSidebar: () => void;
+  notebookUnavailable?: Notebook['unavailable'];
+  onReviewNotebook?: () => void;
 };
 
 function noteDate(value: string) {
@@ -35,11 +37,11 @@ const NoteRow = memo(function NoteRow({ note, notebookName, selected, onSelect }
   return <button className={`note-row ${selected ? 'selected' : ''}`} onClick={() => onSelect(note.id)} aria-current={selected ? 'page' : undefined}>
     <span className="note-row-top"><span className="note-row-title">{note.title.trim() || 'Untitled note'}</span><span className="note-row-date">{noteDate(note.updatedAt)}</span></span>
     <span className="note-row-preview">{snippet}</span>
-    <span className="note-row-bottom"><FileText size={11} /><span>{notebookName}</span>{note.tags[0] && <><span className="note-row-dot" /><span className="note-row-tag">#{note.tags[0]}</span></>}{note.pinned && <><span className="note-row-dot" /><span>Pinned</span></>}</span>
+    <span className="note-row-bottom"><FileText size={11} /><span>{notebookName}</span>{note.tags[0] && <><span className="note-row-dot" /><span className="note-row-tag">#{note.tags[0]}</span></>}{note.pinned && <><span className="note-row-dot" /><span>Pinned</span></>}{note.unavailable && <><span className="note-row-dot" /><CloudOff size={11} /><span>{note.unavailable === 'unrecovered' ? 'Needs review' : 'Local copy'}</span></>}</span>
   </button>;
 });
 
-export function NoteList({ title, viewKey, notes, notebooks, selectedId, onSelect, onNew, onSearch, onOpenSidebar }: Props) {
+export function NoteList({ title, viewKey, notes, notebooks, selectedId, onSelect, onNew, onSearch, onOpenSidebar, notebookUnavailable, onReviewNotebook }: Props) {
   const modifier = useShortcutModifier();
   const [page, setPage] = useState({ key: viewKey, count: NOTE_PAGE_SIZE });
   useEffect(() => { setPage({ key: viewKey, count: NOTE_PAGE_SIZE }); }, [viewKey]);
@@ -61,6 +63,7 @@ export function NoteList({ title, viewKey, notes, notebooks, selectedId, onSelec
       </div>
       <div className="list-meta">{notes.length} {notes.length === 1 ? 'note' : 'notes'}</div>
     </div>
+    {notebookUnavailable && <div className="notebook-unavailable"><CloudOff size={13} /><span>{notebookUnavailable === 'unrecovered' ? 'Shared notebook unavailable; local changes need review.' : 'Unavailable shared notebook · read-only local copy.'}</span>{notebookUnavailable === 'unrecovered' && <button className="text-button" onClick={onReviewNotebook}>Review</button>}</div>}
     <div className="list-toolbar"><button className="list-search" onClick={onSearch}><Search size={14} /><span>Find a note</span><span className="shortcut">{modifier} K</span></button></div>
     <div className="note-list-items">
       {sorted.length > 0 ? <>

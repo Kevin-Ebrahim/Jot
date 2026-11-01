@@ -31,7 +31,7 @@ function fakeServer(userId: string) {
     if (path === '/api/notes' || path === '/api/notebooks') {
       const kind = path === '/api/notes' ? 'note' : 'notebook';
       const items = kind === 'note' ? notes : notebooks;
-      return json({ [kind === 'note' ? 'notes' : 'notebooks']: [...items.values()].filter(item => !revoked.has(item.data.id)).map(item => ({ [kind]: item.data, version: item.version, role: item.role })) });
+      return json({ complete: true, [kind === 'note' ? 'notes' : 'notebooks']: [...items.values()].filter(item => !revoked.has(item.data.id)).map(item => ({ [kind]: item.data, version: item.version, role: item.role })) });
     }
     const attachmentMatch = path.match(/^\/api\/notes\/([^/]+)\/attachments(?:\/([^/]+))?$/);
     if (attachmentMatch) {
@@ -85,7 +85,7 @@ function fakeServer(userId: string) {
   };
   return { notes, notebooks, attachments, handler, setSession(id: string) { sessionUser = id; },
     loseNextResponse() { offlineAfterWrite = true; }, reconnect() { offline = false; }, callCount() { return calls; },
-    rejectNextWrite() { failNextWrite = true; }, revoke(id: string) { revoked.add(id); },
+    rejectNextWrite() { failNextWrite = true; }, revoke(id: string) { revoked.add(id); }, unrevoke(id: string) { revoked.delete(id); },
     loseNextAttachmentResponse() { loseAttachmentResponse = true; },
     delayAttachment(method: 'PUT' | 'DELETE') {
       let arrive!: () => void, release!: () => void;
@@ -382,7 +382,7 @@ test('a confirmed personal recovery acknowledges a revoked original without dele
   const unavailable = (await jotStore.getNote(noteId))!;
   const recovered = await jotStore.copyUnavailableNoteToInbox(noteId, unavailable.revision, { body: 'reviewed visible draft' });
   const before = await syncWorkspace();
-  assert.ok(before.errors.some(message => /no longer accessible/i.test(message)));
+  assert.ok(before.errors.some(message => /unavailable.*unrecovered/i.test(message)));
   await jotStore.acknowledgeUnavailableNote(noteId, unavailable.revision, recovered.id);
   const after = await syncWorkspace();
   assert.deepEqual(after.errors, []);
@@ -391,5 +391,91 @@ test('a confirmed personal recovery acknowledges a revoked original without dele
   const latest = (await jotStore.getNote(recovered.id))!;
   await jotStore.trashNote(latest.id, latest.revision);
   const trashed = await syncWorkspace();
-  assert.ok(trashed.errors.some(message => /no longer accessible/i.test(message)));
+  assert.ok(trashed.errors.some(message => /unavailable.*unrecovered/i.test(message)));
+});
+
+test('a clean directly shared note becomes visibly unavailable without a persistent error', async () => {
+  const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+  const noteId = crypto.randomUUID(), timestamp = new Date().toISOString();
+  server.notes.set(noteId, { data: { id: noteId, title: 'Shared', body: 'cached content', tags: [], notebookId: null,
+    createdAt: timestamp, updatedAt: timestamp, deletedAt: null, pinned: false }, version: 1, role: 'editor' });
+  await switchWorkspace(userId); await syncWorkspace();
+  server.revoke(noteId);
+  const result = await syncWorkspace();
+  assert.deepEqual(result.errors, []);
+  const local = (await jotStore.getNote(noteId))!;
+  assert.equal(local.unavailable, 'clean'); assert.equal(local.role, 'viewer'); assert.equal(local.syncState, 'local');
+  assert.equal(local.body, 'cached content');
+  await assert.rejects(jotStore.updateNote(noteId, { body: 'unauthorized' }, local.revision), /view-only/i);
+  server.unrevoke(noteId);
+  await syncWorkspace();
+  const restored = (await jotStore.getNote(noteId))!;
+  assert.equal(restored.unavailable, undefined); assert.equal(restored.role, 'editor'); assert.equal(restored.syncState, 'synced');
+});
+
+test('notebook-inherited revocation preserves clean notes and explicitly acknowledges unsynced notebook metadata', async () => {
+  const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+  const notebookId = crypto.randomUUID(), noteId = crypto.randomUUID(), timestamp = new Date().toISOString();
+  server.notebooks.set(notebookId, { data: { id: notebookId, name: 'Shared notebook', createdAt: timestamp, updatedAt: timestamp, deletedAt: null }, version: 1, role: 'editor' });
+  server.notes.set(noteId, { data: { id: noteId, title: 'Shared note', body: 'cached note', tags: [], notebookId,
+    createdAt: timestamp, updatedAt: timestamp, deletedAt: null, pinned: false }, version: 1, role: 'editor' });
+  await switchWorkspace(userId); await syncWorkspace();
+  await jotStore.renameNotebook(notebookId, 'unsynced local name');
+  server.revoke(notebookId); server.revoke(noteId);
+  const result = await syncWorkspace();
+  assert.ok(result.errors.some(message => /unavailable notebooks.*unrecovered/i.test(message)));
+  const book = (await jotStore.listNotebooks())[0], note = (await jotStore.getNote(noteId))!;
+  assert.equal(book.name, 'unsynced local name'); assert.equal(book.unavailable, 'unrecovered'); assert.equal(book.role, 'viewer');
+  assert.equal(note.body, 'cached note'); assert.equal(note.unavailable, 'clean'); assert.equal(note.role, 'viewer');
+  await jotStore.acknowledgeUnavailableNotebook(book.id, book.revision);
+  const after = await syncWorkspace();
+  assert.deepEqual(after.errors, []);
+  assert.equal((await jotStore.listNotebooks())[0].unavailable, 'recovered');
+  assert.equal((await jotStore.listNotebooks())[0].name, 'unsynced local name');
+});
+
+for (const mode of ['network', 'incomplete', 'invalid'] as const) {
+  test(`${mode} snapshot never marks previously synced records unavailable`, async () => {
+    const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+    const noteId = crypto.randomUUID(), notebookId = crypto.randomUUID(), timestamp = new Date().toISOString();
+    server.notebooks.set(notebookId, { data: { id: notebookId, name: 'Book', createdAt: timestamp, updatedAt: timestamp, deletedAt: null }, version: 1, role: 'editor' });
+    server.notes.set(noteId, { data: { id: noteId, title: 'Shared', body: 'cached', tags: [], notebookId,
+      createdAt: timestamp, updatedAt: timestamp, deletedAt: null, pinned: false }, version: 1, role: 'editor' });
+    await switchWorkspace(userId); await syncWorkspace();
+    const originalFetch = server.handler;
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/notes') {
+        if (mode === 'network') throw new TypeError('connection lost');
+        if (mode === 'incomplete') return Response.json({ notes: [] });
+        return Response.json({ complete: true, notes: [{ note: { id: 'invalid' }, version: 1, role: 'viewer' }] });
+      }
+      return originalFetch(input, init);
+    };
+    server.revoke(notebookId); server.revoke(noteId);
+    const result = await syncWorkspace();
+    assert.ok(result.errors.length > 0);
+    const book = (await jotStore.listNotebooks())[0], note = (await jotStore.getNote(noteId))!;
+    assert.equal(book.unavailable, undefined); assert.equal(book.role, 'editor');
+    assert.equal(note.unavailable, undefined); assert.equal(note.role, 'editor'); assert.equal(note.body, 'cached');
+  });
+}
+
+test('revoked access with an unsynced attachment requires recovery even when note text was synced', async () => {
+  const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+  const noteId = crypto.randomUUID(), timestamp = new Date().toISOString();
+  server.notes.set(noteId, { data: { id: noteId, title: 'Shared', body: 'synced text', tags: [], notebookId: null,
+    createdAt: timestamp, updatedAt: timestamp, deletedAt: null, pinned: false }, version: 1, role: 'editor' });
+  await switchWorkspace(userId); await syncWorkspace();
+  const file = await jotStore.addAttachment(noteId, new Blob(['unsynced private file']), 'draft.txt');
+  server.revoke(noteId);
+  const result = await syncWorkspace();
+  assert.ok(result.errors.some(message => /unavailable notes.*unrecovered/i.test(message)));
+  const unavailable = (await jotStore.getNote(noteId))!;
+  assert.equal(unavailable.unavailable, 'unrecovered');
+  assert.equal(await (await jotStore.listAttachments(noteId))[0].blob.text(), 'unsynced private file');
+  const recovered = await jotStore.copyUnavailableNoteToInbox(noteId, unavailable.revision);
+  assert.equal(await (await jotStore.listAttachments(recovered.id))[0].blob.text(), 'unsynced private file');
+  await jotStore.acknowledgeUnavailableNote(noteId, unavailable.revision, recovered.id);
+  assert.deepEqual((await syncWorkspace()).errors, []);
+  assert.equal(server.attachments.has(file.id), false);
 });

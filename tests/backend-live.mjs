@@ -81,7 +81,9 @@ try {
   response = await json(`/api/notes/${note.id}`, { method: 'PUT', account: owner, body: payload });
   assert.equal(response.value.version, 1);
   response = await json('/api/notes', { account: editor });
+  assert.equal(response.value.complete, true);
   assert.equal(response.value.notes[0].role, 'editor');
+  assert.equal((await json('/api/notebooks', { account: editor })).value.complete, true);
   assert.deepEqual((await json('/api/notes', { account: outsider })).value.notes, []);
   const edited = { ...note, body: 'editor saved body' };
   response = await json(`/api/notes/${note.id}`, { method: 'PUT', account: editor, body: { operationId: randomUUID(), baseVersion: 1, note: edited } });

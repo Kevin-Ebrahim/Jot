@@ -41,7 +41,7 @@ A production service worker can cache the app shell after a successful first loa
 
 ## Privacy and backups
 
-IndexedDB in the browser is **not encrypted by Jot**. A full JSON backup includes live attachments and may optionally be password-encrypted; save that password separately because it cannot be recovered. Markdown ZIP export includes notes, live attachments, and a metadata manifest. Imports merge rather than overwrite existing notes.
+IndexedDB in the browser is **not encrypted by Jot**. A JSON backup contains the current workspace's notes, notebooks, and live local attachments, up to 150 MiB encoded. It may optionally be password-encrypted; save that password separately because it cannot be recovered. Comments, shares, and account settings are not included; protect those with a server SQLite backup. Markdown ZIP export includes notes, live attachments, and a metadata manifest, not server comments or shares. Imports create new copies rather than overwrite notes; imports into an account workspace are queued for sync.
 
 Server content is plaintext by default. For a **new, empty data directory only**, set `JOT_ENCRYPTION_KEY` to a securely generated 64-character hexadecimal key before the first start. Keep the same key for every restart and back it up separately from the database. Losing it makes encrypted content unreadable; existing plaintext databases are not silently migrated. This optional AES-256-GCM mode encrypts note/notebook content, comment text, and attachment filenames and bytes, but account emails and operational metadata remain visible. The running server can decrypt the content: it is **not end-to-end encryption**. It does not encrypt browser storage or exports automatically. See [server notes](src/server/README.md) for the precise scope and configuration.
 
@@ -49,7 +49,7 @@ For any non-local deployment, use HTTPS and a trusted reverse proxy. Set `JOT_AP
 
 ## Capture and organization
 
-Markdown notes support tags, links, checklists, search, templates, and local rediscovery. A web capture saves an HTTP(S) bookmark and optional pasted/imported content; it does not fetch the remote page. PDF capture extracts selectable text locally, not scanned pages. Image OCR is opt-in and English-only; on first use it loads pinned engine and language files from this app's origin, and the image is processed locally.
+Markdown notes support tags, links, checklists, search, templates, and local rediscovery. A web capture saves an HTTP(S) bookmark and optional pasted/imported content; it does not fetch the remote page. PDF capture extracts selectable text locally, not scanned pages. Image OCR is opt-in and English-only; on first use it loads pinned engine and language files from this app's origin, and the image is processed locally. A tested browser recognized and searched an image online and, after those assets were cached, offline. Results vary and offline use depends on retained assets.
 
 Prerecorded audio transcription is opt-in, English-only, and limited to two minutes and 10 MiB. It is designed to run locally in the browser using `Xenova/whisper-tiny.en`; first use downloads about 45 MB of model files from Hugging Face plus runtime from this app's origin. Audio is not sent to a transcription service, but normal account sync may send saved audio and transcripts to your server. Review results for mistakes; browser inference is still awaiting verification. Recording and live dictation depend on browser support, and a browser speech provider may receive dictated audio.
 

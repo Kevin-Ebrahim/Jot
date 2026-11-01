@@ -1,6 +1,7 @@
 /** A workspace record is local-first; serverVersion is distinct from the local CAS revision. */
 export type SyncState = 'local' | 'dirty' | 'synced' | 'conflict';
 export type AccessRole = 'owner' | 'editor' | 'viewer';
+export type UnavailableState = 'clean' | 'unrecovered' | 'recovered';
 
 export interface Note {
   id: string;
@@ -15,6 +16,7 @@ export interface Note {
   serverVersion: number | null;
   syncState: SyncState;
   role: AccessRole;
+  unavailable?: UnavailableState;
   pinned: boolean;
 }
 
@@ -28,6 +30,7 @@ export interface Notebook {
   serverVersion: number | null;
   syncState: SyncState;
   role: AccessRole;
+  unavailable?: UnavailableState;
 }
 
 export interface Attachment {
@@ -50,8 +53,8 @@ export interface Reminder { id: string; noteId: string; dueAt: string; completed
 export interface NoteTask { id: string; noteId: string; text: string; completed: boolean; dueAt?: string | null; }
 export interface Comment { id: string; noteId: string; author: { id: string; email: string }; body: string; createdAt: string; updatedAt: string; }
 
-export type ServerNote = Omit<Note, 'revision' | 'serverVersion' | 'syncState' | 'role'>;
-export type ServerNotebook = Omit<Notebook, 'revision' | 'serverVersion' | 'syncState' | 'role'>;
+export type ServerNote = Omit<Note, 'revision' | 'serverVersion' | 'syncState' | 'role' | 'unavailable'>;
+export type ServerNotebook = Omit<Notebook, 'revision' | 'serverVersion' | 'syncState' | 'role' | 'unavailable'>;
 export interface ServerRecord<T> { note: T; version: number; role: AccessRole; }
 export interface SyncResult { pushed: number; pulled: number; conflicts: number; errors: string[]; }
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error';

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import {
-  CheckSquare2, CircleAlert, FileText, Folder,
+  CheckSquare2, CircleAlert, CloudOff, FileText, Folder,
   Inbox, LayoutTemplate, MoreHorizontal, Plus, Search, Settings2, Sparkles,
   Star, Trash2, UserRound, Zap,
 } from 'lucide-react';
@@ -26,10 +26,11 @@ type Props = {
   onRenameNotebook: (notebook: Notebook) => void;
   onShareNotebook: (notebook: Notebook) => void;
   onDeleteNotebook: (notebook: Notebook) => void;
+  onAcknowledgeNotebook: (notebook: Notebook) => void;
   onAccount: () => void;
 };
 
-export function Sidebar({ view, notebooks, counts, online, accountAttention, open, onClose, onNavigate, onNew, onCapture, onSearch, onCreateNotebook, onRenameNotebook, onShareNotebook, onDeleteNotebook, onAccount }: Props) {
+export function Sidebar({ view, notebooks, counts, online, accountAttention, open, onClose, onNavigate, onNew, onCapture, onSearch, onCreateNotebook, onRenameNotebook, onShareNotebook, onDeleteNotebook, onAcknowledgeNotebook, onAccount }: Props) {
   const [notebookMenu, setNotebookMenu] = useState<string | null>(null);
   const modifier = useShortcutModifier();
   useEffect(() => {
@@ -66,10 +67,11 @@ export function Sidebar({ view, notebooks, counts, online, accountAttention, ope
         <div className="sidebar-heading"><span>Notebooks</span><button onClick={onCreateNotebook} title="New notebook" aria-label="New notebook"><Plus size={14} /></button></div>
         <nav className="nav-group" aria-label="Notebooks">
           {notebooks.map((notebook) => <div className="notebook-row" data-notebook-id={notebook.id} key={notebook.id}>
-            <button className={`nav-item ${view.kind === 'notebook' && view.id === notebook.id ? 'active' : ''}`} onClick={() => navigate({ kind: 'notebook', id: notebook.id })}><Folder size={16} /><span className="label">{notebook.name}</span><span className="nav-count">{counts.notebooks[notebook.id] || ''}</span></button>
+            <button className={`nav-item ${view.kind === 'notebook' && view.id === notebook.id ? 'active' : ''}`} onClick={() => navigate({ kind: 'notebook', id: notebook.id })}><Folder size={16} /><span className="label">{notebook.name}</span>{notebook.unavailable ? <CloudOff size={13} aria-label="Unavailable shared notebook; local copy" /> : <span className="nav-count">{counts.notebooks[notebook.id] || ''}</span>}</button>
             <div className="notebook-popover-wrap"><button className="icon-button notebook-menu-button" aria-label={`Actions for ${notebook.name}`} aria-expanded={notebookMenu === notebook.id} onClick={() => setNotebookMenu(notebookMenu === notebook.id ? null : notebook.id)}><MoreHorizontal size={15} /></button>
               {notebookMenu === notebook.id && <div className="small-menu notebook-menu" role="menu">
                 <button role="menuitem" disabled={notebook.role !== 'owner'} onClick={() => { setNotebookMenu(null); onRenameNotebook(notebook); }}>Rename</button>
+                {notebook.unavailable === 'unrecovered' && <button role="menuitem" onClick={() => { setNotebookMenu(null); onAcknowledgeNotebook(notebook); }}>Review local copy</button>}
                 <button role="menuitem" onClick={() => { setNotebookMenu(null); onShareNotebook(notebook); }}>Sharing</button>
                 <button role="menuitem" disabled={notebook.role !== 'owner'} onClick={() => { setNotebookMenu(null); onDeleteNotebook(notebook); }}>Delete notebook</button>
               </div>}

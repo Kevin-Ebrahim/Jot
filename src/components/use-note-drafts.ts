@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Note, NotePatch } from '@/lib/types';
 import { canAcceptRecoveredDraft } from './draft-recovery';
+import { createDraftSaveScheduler, scheduleDraftEdit } from './draft-save-scheduler';
 
 type DraftStatus = 'saved' | 'dirty' | 'saving' | 'conflict' | 'error';
 export interface NoteDraft {
@@ -28,10 +29,12 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
   const [entries, setEntries] = useState<Record<string, NoteDraft>>({});
   const entriesRef = useRef(entries);
   const updateRef = useRef(updateNote);
-  const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const running = useRef<Partial<Record<string, Promise<Note | undefined>>>>({});
   const recoveryPaused = useRef(new Set<string>());
   const saveRef = useRef<(id: string) => Promise<Note | undefined>>(async () => undefined);
+  const schedulerRef = useRef<ReturnType<typeof createDraftSaveScheduler> | null>(null);
+  if (!schedulerRef.current) schedulerRef.current = createDraftSaveScheduler((id) => { void saveRef.current(id); });
+  const scheduler = schedulerRef.current;
   updateRef.current = updateNote;
 
   const writeEntry = useCallback((id: string, entry: NoteDraft) => {
@@ -44,7 +47,7 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
   }, []);
 
   const save = useCallback(async (id: string): Promise<Note | undefined> => {
-    clearTimeout(timers.current[id]);
+    scheduler.clear(id);
     if (recoveryPaused.current.has(id)) return undefined;
     if (running.current[id]) {
       await running.current[id];
@@ -89,7 +92,7 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     delete running.current[id];
     if (!recoveryPaused.current.has(id) && entriesRef.current[id]?.status === 'dirty') return saveRef.current(id);
     return result;
-  }, [writeEntry]);
+  }, [writeEntry, scheduler]);
   saveRef.current = save;
 
   const change = useCallback((note: Note, patch: NotePatch) => {
@@ -103,9 +106,8 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
       error: undefined,
     };
     writeEntry(note.id, next);
-    clearTimeout(timers.current[note.id]);
-    if (next.status !== 'conflict' && !recoveryPaused.current.has(note.id)) timers.current[note.id] = setTimeout(() => { void saveRef.current(note.id); }, 650);
-  }, [get, writeEntry]);
+    scheduleDraftEdit(scheduler, note.id, next.status !== 'conflict' && !recoveryPaused.current.has(note.id));
+  }, [get, writeEntry, scheduler]);
 
   const keepMine = useCallback(async (id: string) => {
     const entry = entriesRef.current[id];
@@ -131,20 +133,20 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     const next = { ...entriesRef.current };
     for (const note of notes) {
       const entry = next[note.id];
-      if (entry?.status === 'saved' && note.revision >= entry.baseRevision && (note.revision > entry.baseRevision || note.serverVersion !== entry.note.serverVersion || note.syncState !== entry.note.syncState || note.role !== entry.note.role)) {
+      if (entry?.status === 'saved' && note.revision >= entry.baseRevision && (note.revision > entry.baseRevision || note.serverVersion !== entry.note.serverVersion || note.syncState !== entry.note.syncState || note.role !== entry.note.role || note.unavailable !== entry.note.unavailable)) {
         next[note.id] = { ...entry, note, baseRevision: note.revision };
         changed = true;
-      } else if (entry && entry.status !== 'saved' && note.role !== entry.note.role) {
+      } else if (entry && entry.status !== 'saved' && (note.role !== entry.note.role || note.unavailable !== entry.note.unavailable || note.syncState !== entry.note.syncState || note.serverVersion !== entry.note.serverVersion)) {
         // Permission changes apply immediately, but never replace unsaved text.
         // Do not keep retrying a write that the new role cannot perform.
-        if (note.role === 'viewer') clearTimeout(timers.current[note.id]);
-        next[note.id] = { ...entry, note: { ...entry.note, role: note.role, syncState: note.syncState, serverVersion: note.serverVersion },
+        if (note.role === 'viewer') scheduler.clear(note.id);
+        next[note.id] = { ...entry, note: { ...entry.note, role: note.role, syncState: note.syncState, serverVersion: note.serverVersion, unavailable: note.unavailable },
           ...(note.role === 'viewer' && entry.status === 'dirty' ? { status: 'error' as const, error: 'Access changed before this draft could be saved.' } : {}) };
         changed = true;
       }
     }
     if (changed) { entriesRef.current = next; setEntries(next); }
-  }, [notes]);
+  }, [notes, scheduler]);
 
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -156,9 +158,9 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     window.addEventListener('beforeunload', warn);
     return () => {
       window.removeEventListener('beforeunload', warn);
-      Object.values(timers.current).forEach(clearTimeout);
+      scheduler.clearAll();
     };
-  }, []);
+  }, [scheduler]);
 
   const isBusy = useCallback((id: string) => {
     const entry = entriesRef.current[id];
@@ -174,28 +176,27 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
   }, []);
   const prepareRecovery = useCallback(async (note: Note): Promise<NoteDraft> => {
     recoveryPaused.current.add(note.id);
-    clearTimeout(timers.current[note.id]);
+    scheduler.clear(note.id);
     // An already-started write may settle, but no retry may start while copying.
     const pending = running.current[note.id];
     if (pending) await pending;
     return get(note);
-  }, [get]);
+  }, [get, scheduler]);
   const finishRecovery = useCallback((note: Note, reviewedSequence: number): boolean => {
-    clearTimeout(timers.current[note.id]);
+    scheduler.clear(note.id);
     const entry = entriesRef.current[note.id];
     if (!canAcceptRecoveredDraft(entry?.sequence, reviewedSequence)) { recoveryPaused.current.delete(note.id); return false; }
     writeEntry(note.id, { note, baseRevision: note.revision, status: 'saved', sequence: reviewedSequence + 1 });
     recoveryPaused.current.delete(note.id);
     return true;
-  }, [writeEntry]);
+  }, [writeEntry, scheduler]);
   const cancelRecovery = useCallback((id: string) => { recoveryPaused.current.delete(id); }, []);
   const reset = useCallback(() => {
-    Object.values(timers.current).forEach(clearTimeout);
-    timers.current = {};
+    scheduler.clearAll();
     recoveryPaused.current.clear();
     entriesRef.current = {};
     setEntries({});
-  }, []);
+  }, [scheduler]);
 
   return { entries, get, change, save, keepMine, useLatest, retry, isBusy, flushAll, prepareRecovery, finishRecovery, cancelRecovery, reset };
 }

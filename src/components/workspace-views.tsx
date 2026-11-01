@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { ArrowDownToLine, ArrowUpFromLine, CalendarDays, Check, ChevronRight, FileText, PanelLeft, RotateCcw } from 'lucide-react';
-import type { NewNote, Note } from '@/lib/types';
+import type { NewNote, Note, Notebook } from '@/lib/types';
 import { createFromTemplate, getDueReviews, getPriorMeetings, getRecurringSchedule, getResurfacedNotes, NOTE_TEMPLATES, setRecurringSchedule } from '@/lib/features';
 import type { View } from './sidebar';
 import { cachedTasks } from './note-derivations';
@@ -13,6 +13,7 @@ type Props = {
   view: View;
   notes: Note[];
   deletedNotes: Note[];
+  deletedNotebooks: Notebook[];
   theme: 'system' | 'dark' | 'light';
   workspaceId: string | null;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
@@ -24,6 +25,8 @@ type Props = {
   onSetAutomation: (source: Note, enabled: boolean) => Promise<void>;
   onCreate: (input: NewNote) => Promise<void>;
   onRestore: (note: Note) => Promise<void>;
+  onRecoverDeleted: (note: Note) => Promise<void>;
+  onReviewUnavailableNotebook: (notebook: Notebook) => void;
   onExport: (password?: string) => Promise<Blob>;
   onExportMarkdown: () => Promise<Blob>;
   onImport: (file: Blob, password?: string) => Promise<void>;
@@ -45,7 +48,7 @@ function download(blob: Blob, name: string) {
 }
 
 export function WorkspaceViews(props: Props) {
-  const { view, notes, deletedNotes, theme, workspaceId, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onSetAutomation, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
+  const { view, notes, deletedNotes, deletedNotebooks, theme, workspaceId, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onSetAutomation, onCreate, onRestore, onRecoverDeleted, onReviewUnavailableNotebook, onExport, onExportMarkdown, onImport, onAccount } = props;
   const tasks = useMemo(() => view.kind === 'tasks' ? cachedTasks(notes) : [], [notes, view.kind]);
   const resurfaced = useMemo(() => getResurfacedNotes(notes, new Date(), 20), [notes]);
   const meetings = useMemo(() => getPriorMeetings(notes, new Date(), 5), [notes]);
@@ -55,6 +58,7 @@ export function WorkspaceViews(props: Props) {
   const [importPassword, setImportPassword] = useState('');
   const [importFile, setImportFile] = useState<File | null>(null);
   const [confirmAccountImport, setConfirmAccountImport] = useState(false);
+  const [confirmTrashRecovery, setConfirmTrashRecovery] = useState<string | null>(null);
   const accountWorkspace = !!workspaceId;
   const [working, setWorking] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
@@ -115,8 +119,10 @@ export function WorkspaceViews(props: Props) {
     </div></main>;
   }
   if (view.kind === 'trash') {
+    const unavailableNotebooks = deletedNotebooks.filter((notebook) => !!notebook.unavailable);
     return <main className="workspace-view"><div className="workspace-view-inner"><ViewHeading title="Trash" description="Notes you’ve removed are kept here until you restore them." onOpenSidebar={onOpenSidebar} />
-      <section className="view-section">{feedback?.error && <p className="dialog-error" role="alert">{feedback.text}</p>}{deletedNotes.length ? deletedNotes.map((note) => <div className="view-row" key={note.id}><FileText size={17} /><div className="view-row-main"><span className="view-row-title">{note.title || 'Untitled note'}</span><span className="view-row-description">Removed {note.deletedAt ? new Date(note.deletedAt).toLocaleDateString() : ''}</span></div><button className="button" disabled={note.role !== 'owner' || working} onClick={() => { void run(() => onRestore(note), ''); }}><RotateCcw size={14} /> Restore</button></div>) : <div className="empty-view"><strong>Trash is empty.</strong>Removed notes will be kept here.</div>}</section>
+      <section className="view-section">{feedback?.error && <p className="dialog-error" role="alert">{feedback.text}</p>}{deletedNotes.length ? deletedNotes.map((note) => <div className="trash-item" key={note.id}><div className="view-row"><FileText size={17} /><div className="view-row-main"><span className="view-row-title">{note.title || 'Untitled note'}</span><span className="view-row-description">Removed {note.deletedAt ? new Date(note.deletedAt).toLocaleDateString() : ''}{note.unavailable ? ' · Shared note unavailable' : ''}</span></div>{note.role === 'viewer' && note.unavailable ? <button className="button" disabled={working} onClick={() => setConfirmTrashRecovery(note.id)}>Make personal copy</button> : <button className="button" disabled={note.role !== 'owner' || working} onClick={() => { void run(() => onRestore(note), ''); }}><RotateCcw size={14} /> Restore</button>}</div>{confirmTrashRecovery === note.id && <div className="trash-recovery-confirm"><span>The copy includes local files, goes to Inbox, and is queued to sync to this account. The original stays in Trash.</span><button className="button" disabled={working} onClick={() => { void run(() => onRecoverDeleted(note), ''); }}>Confirm copy</button><button className="button ghost" disabled={working} onClick={() => setConfirmTrashRecovery(null)}>Cancel</button></div>}</div>) : <div className="empty-view"><strong>Trash is empty.</strong>Removed notes will be kept here.</div>}</section>
+      {unavailableNotebooks.length > 0 && <section className="view-section"><h2>Unavailable notebooks</h2>{unavailableNotebooks.map((notebook) => <div className="view-row" key={notebook.id}><div className="view-row-main"><span className="view-row-title">{notebook.name}</span><span className="view-row-description">Removed locally · read-only cached copy{notebook.unavailable === 'recovered' ? ' · kept locally' : ''}</span></div>{notebook.unavailable === 'unrecovered' && <button className="button" onClick={() => onReviewUnavailableNotebook(notebook)}>Review</button>}</div>)}</section>}
     </div></main>;
   }
   return <main className="workspace-view"><div className="workspace-view-inner"><ViewHeading title="Settings" description="Make Jot feel like yours, and keep a copy of what matters." onOpenSidebar={onOpenSidebar} />

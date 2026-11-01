@@ -11,11 +11,11 @@ export function createStableNoteMerger() {
       const draft = drafts[note.id]?.note;
       const previous = cache.get(note.id);
       const old = previous?.source;
-      const sameSource = old === note || (!!old && old.revision === note.revision && old.role === note.role && old.syncState === note.syncState && old.serverVersion === note.serverVersion &&
+      const sameSource = old === note || (!!old && old.revision === note.revision && old.role === note.role && old.syncState === note.syncState && old.serverVersion === note.serverVersion && old.unavailable === note.unavailable &&
         old.title === note.title && old.body === note.body && old.notebookId === note.notebookId && old.pinned === note.pinned && old.createdAt === note.createdAt && old.updatedAt === note.updatedAt && old.deletedAt === note.deletedAt &&
         old.tags.length === note.tags.length && old.tags.every((tag, index) => tag === note.tags[index]));
       if (previous && sameSource && previous.draft === draft) return previous.result;
-      const merged = draft ? { ...draft, role: note.role, syncState: note.syncState, serverVersion: note.serverVersion } : note;
+      const merged = draft ? { ...draft, role: note.role, syncState: note.syncState, serverVersion: note.serverVersion, unavailable: note.unavailable } : note;
       cache.set(note.id, { source: note, draft, result: merged });
       return merged;
     });

@@ -225,6 +225,7 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
   const sessionRoute = await import('../src/app/api/auth/session/route');
   const logoutRoute = await import('../src/app/api/auth/logout/route');
   const notesRoute = await import('../src/app/api/notes/route');
+  const notebooksRoute = await import('../src/app/api/notebooks/route');
   const noteRoute = await import('../src/app/api/notes/[id]/route');
   const shareRoute = await import('../src/app/api/notes/[id]/shares/route');
   function req(route: string, method: string, body?: unknown, cookie?: string, csrf?: string, suppliedOrigin = origin): Request {
@@ -244,7 +245,9 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     return { ...result, cookie: cookie!.split(';')[0] };
   }
   try {
-    assert.equal((await notesRoute.GET(req('/api/notes', 'GET'))).status, 401);
+    const unauthorized = await notesRoute.GET(req('/api/notes', 'GET'));
+    assert.equal(unauthorized.status, 401);
+    assert.equal((await unauthorized.json()).complete, undefined);
     assert.equal((await registerRoute.POST(req('/api/auth/register', 'POST', { email: 'evil@example.test', password: 'a strong password here' }, undefined, undefined, 'https://evil.example'))).status, 403);
     const alice = await account('http-alice@example.test');
     const bob = await account('http-bob@example.test');
@@ -252,6 +255,9 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     assert.equal((await notesRoute.GET(new Request(`${origin}/api/notes`, { headers: { cookie: alice.cookie, 'x-jot-workspace': alice.user.id } }))).status, 200);
     const current = await sessionRoute.GET(req('/api/auth/session', 'GET', undefined, alice.cookie));
     assert.equal((await current.json()).user.email, alice.user.email);
+    const completeSnapshot = await notesRoute.GET(req('/api/notes', 'GET', undefined, alice.cookie));
+    assert.equal((await completeSnapshot.json()).complete, true);
+    assert.equal((await (await notebooksRoute.GET(req('/api/notebooks', 'GET', undefined, alice.cookie))).json()).complete, true);
     const item = note();
     const payload = { baseVersion: 0, operationId: randomUUID(), note: item };
     const ctx = { params: Promise.resolve({ id: item.id }) };

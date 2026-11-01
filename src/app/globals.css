@@ -367,3 +367,8 @@ code, pre, kbd { font-family: var(--font-mono); }
 .load-more-notes span { color: var(--subtle); }
 .import-confirm { display: flex; align-items: flex-start; gap: 8px; margin-top: 11px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .import-confirm input { flex: none; margin-top: 2px; accent-color: var(--accent); }
+.notebook-unavailable { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 7px; margin: 0 20px 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.notebook-unavailable svg { flex: none; margin-top: 1px; }
+.notebook-unavailable span { flex: 1; min-width: 140px; }
+.trash-recovery-confirm { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 0 14px 29px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.trash-recovery-confirm span { flex: 1 1 240px; }

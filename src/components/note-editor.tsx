@@ -23,6 +23,7 @@ type Props = {
   forceReadOnly?: boolean;
   recoveryAvailable?: boolean;
   recoveryUnavailable?: boolean;
+  unavailable?: Note['unavailable'];
   onCopyUnavailable: () => Promise<void>;
   notes: Note[];
   notebooks: Notebook[];
@@ -63,7 +64,7 @@ function renderWikiLinks(body: string) {
   }).join('');
 }
 
-export function NoteEditor({ draft, busy = false, focusTitle = false, onTitleFocused, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText, allowedRemoteImages, onAllowRemoteImage }: Props) {
+export function NoteEditor({ draft, busy = false, focusTitle = false, onTitleFocused, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, unavailable, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText, allowedRemoteImages, onAllowRemoteImage }: Props) {
   const note = draft.note;
   const modifier = useShortcutModifier();
   const viewer = forceReadOnly || note.role === 'viewer';
@@ -197,7 +198,7 @@ export function NoteEditor({ draft, busy = false, focusTitle = false, onTitleFoc
     : draft.status === 'conflict' ? 'Conflict'
       : draft.status === 'error' ? 'Not saved'
         : note.syncState === 'conflict' ? 'Sync conflict'
-          : note.syncState === 'synced' ? 'Synced' : 'Saved locally';
+          : unavailable ? 'Read-only local copy' : note.syncState === 'synced' ? 'Synced' : 'Saved locally';
 
   return (
     <main className="editor" aria-label="Note editor" aria-busy={busy}>
@@ -232,7 +233,7 @@ export function NoteEditor({ draft, busy = false, focusTitle = false, onTitleFoc
           </div>}
           {recoveryAvailable ? <div className="notice editor-notice recovery-notice"><CircleAlert size={15} /><div><strong>{recoveryUnavailable ? 'This shared note is no longer available' : 'Your editing access changed'}</strong>Your local version and any visible draft are still here. You can make a personal copy, including its local files.
             {recoverConfirm ? <><p className="conflict-confirm">The new copy will be in your Inbox and queued to sync to this account. Reconnect and sign in if needed. The original stays read-only.</p><div className="notice-actions"><button className="button" disabled={recoverBusy} onClick={() => { setRecoverBusy(true); setRecoverError(''); void onCopyUnavailable().catch((error) => setRecoverError(error instanceof Error ? error.message : 'Could not make a copy.')).finally(() => setRecoverBusy(false)); }}>{recoverBusy ? 'Copying…' : 'Confirm personal copy'}</button><button className="button ghost" disabled={recoverBusy} onClick={() => setRecoverConfirm(false)}>Cancel</button></div></> : <div className="notice-actions"><button className="button" onClick={() => setRecoverConfirm(true)}>Make personal copy</button></div>}
-            {recoverError && <p className="dialog-error" role="alert">{recoverError}</p>}</div></div> : viewer && <div className="notice editor-notice"><Eye size={15} /><span>You have view-only access to this note.</span></div>}
+            {recoverError && <p className="dialog-error" role="alert">{recoverError}</p>}</div></div> : unavailable ? <div className="notice editor-notice"><CloudOff size={15} /><span>This shared note is unavailable. Its cached copy remains on this device, read-only{unavailable === 'recovered' ? '; your reviewed personal copy is separate' : ''}.</span></div> : viewer && <div className="notice editor-notice"><Eye size={15} /><span>You have view-only access to this note.</span></div>}
           <input ref={titleRef} aria-label="Note title" className="note-title-input" value={note.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="Untitled note" maxLength={300} readOnly={readOnly} />
           <div className="note-properties">
             <span className="property"><CalendarDays size={13} /> Edited <strong>{shortDate(note.updatedAt)}</strong></span>

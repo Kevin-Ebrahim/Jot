@@ -322,7 +322,8 @@ async function copyUnavailableNoteToInboxLocked(sourceId: string, expectedRevisi
     await attachments.add({ ...file, id: newId, noteId: id, serverVersion: null, syncState: 'dirty', deletedAt: null });
   }
   const body = createAttachmentRewriter(referenceMap)(patch.body ?? source.body);
-  const copy: Note = { ...source, ...patch, id, body, title: `${(patch.title ?? source.title) || 'Untitled'} (recovered copy)`.slice(0, 300),
+  const { unavailable: _unavailable, ...sourceContent } = source;
+  const copy: Note = { ...sourceContent, ...patch, id, body, title: `${(patch.title ?? source.title) || 'Untitled'} (recovered copy)`.slice(0, 300),
     notebookId: null, createdAt: timestamp, updatedAt: timestamp, deletedAt: null, revision: 1,
     serverVersion: null, syncState: 'dirty', role: 'owner' };
   await notes.add(copy);
@@ -362,13 +363,34 @@ async function acknowledgeUnavailableNote(sourceId: string, expectedRevision: nu
       throw new Error('The personal copy does not match this recovery.');
     }
     await imports.put({ key: `ack-unavailable-note:${source.id}`, targetId: copy.id });
+    await notes.put({ ...source, unavailable: 'recovered' });
     await tx.done;
     notifyStoreChanged(workspace);
   });
 }
 
-async function listNotebooks(): Promise<Notebook[]> {
-  return (await (await getWorkspaceDb()).getAll('notebooks')).filter(n => !n.deletedAt).sort((a, b) => a.name.localeCompare(b.name));
+/** Explicitly retain an unavailable notebook locally; never delete or upload it. */
+async function acknowledgeUnavailableNotebook(id: string, expectedRevision: number): Promise<void> {
+  const workspace = getWorkspaceId();
+  if (!workspace) throw new Error('This action requires an account workspace.');
+  await withWorkspaceLock(workspace, async () => {
+    if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; acknowledgement was cancelled.');
+    const db = await getWorkspaceDb(workspace);
+    const tx = db.transaction('notebooks', 'readwrite');
+    const notebook = await tx.store.get(id);
+    if (!notebook) throw new Error('The cached notebook no longer exists.');
+    if (notebook.revision !== expectedRevision) throw new Error('The notebook changed; review it again.');
+    if (notebook.role !== 'viewer' || notebook.syncState !== 'local' || !notebook.unavailable) {
+      throw new Error('This notebook is not unavailable.');
+    }
+    await tx.store.put({ ...notebook, unavailable: 'recovered' });
+    await tx.done;
+    notifyStoreChanged(workspace);
+  });
+}
+
+async function listNotebooks(options: { includeDeleted?: boolean } = {}): Promise<Notebook[]> {
+  return (await (await getWorkspaceDb()).getAll('notebooks')).filter(n => options.includeDeleted || !n.deletedAt).sort((a, b) => a.name.localeCompare(b.name));
 }
 function validateNotebookName(name: string): string {
   if (typeof name !== 'string' || !name.trim() || name.length > 150) throw new Error('Choose a notebook name (up to 150 characters).');
@@ -731,7 +753,7 @@ async function copyGuestNotesToAccount(userId: string): Promise<number> {
 
 
 export const jotStore = {
-  listNotes, getNote, createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox, acknowledgeUnavailableNote,
+  listNotes, getNote, createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox, acknowledgeUnavailableNote, acknowledgeUnavailableNotebook,
   listNotebooks, createNotebook, renameNotebook, deleteNotebook,
   listAttachments, addAttachment, deleteAttachment,
   exportBackup, importBackup, exportMarkdownZip, switchWorkspace, copyGuestNotesToAccount,

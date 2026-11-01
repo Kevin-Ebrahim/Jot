@@ -7,14 +7,19 @@ export async function listConflicts(): Promise<SyncConflict[]> {
   const db = await getWorkspaceDb();
   const tx = db.transaction(['conflicts', 'notes', 'notebooks']);
   const conflicts = await tx.objectStore('conflicts').getAll();
+  const visible: SyncConflict[] = [];
   for (const conflict of conflicts) {
     const current = conflict.entity === 'note'
       ? await tx.objectStore('notes').get(conflict.entityId)
       : await tx.objectStore('notebooks').get(conflict.entityId);
+    // Keep the historical snapshot in IndexedDB, but recovery—not a stale
+    // server-version choice—is required while access is unavailable.
+    if (current?.unavailable) continue;
     if (current) conflict.local = current;
+    visible.push(conflict);
   }
   await tx.done;
-  return conflicts.sort((a, b) => b.detectedAt.localeCompare(a.detectedAt));
+  return visible.sort((a, b) => b.detectedAt.localeCompare(a.detectedAt));
 }
 
 /** The choice is explicit: never discard either side during automatic reconciliation. */
@@ -30,6 +35,7 @@ async function resolveConflictLocked(id: string, choice: 'local' | 'server' | 'b
   const table = conflict.entity === 'note' ? tx.objectStore('notes') : tx.objectStore('notebooks');
   const current = await table.get(conflict.entityId) as Note | Notebook | undefined;
   if (!current) throw new Error('The local item no longer exists.');
+  if (current.unavailable) throw new Error('Access is unavailable. Recover a personal copy before resolving this item.');
   if (current.revision !== expectedRevision) throw new Error('The local item changed since review. Refresh the conflict before choosing.');
   if (choice === 'local') {
     if (conflict.role === 'viewer') throw new ReadOnlyError();
@@ -227,7 +233,7 @@ async function retireUnavailable(workspace: string, operation: OutboxChange): Pr
   if (!await outbox.get(operation.operationId)) { await tx.done; return; }
   const store = operation.entity === 'note' ? tx.objectStore('notes') : tx.objectStore('notebooks');
   const current = await store.get(operation.entityId) as Entity | undefined;
-  if (current) await store.put({ ...current, syncState: 'local', role: 'viewer' } as Note & Notebook);
+  if (current) await store.put({ ...current, syncState: 'local', role: 'viewer', unavailable: 'unrecovered' } as Note & Notebook);
   await outbox.delete(operation.operationId);
   await tx.done;
   notifyStoreChanged(workspace);
@@ -238,7 +244,7 @@ async function handleAccessFailure(workspace: string, operation: OutboxChange, r
   try {
     const data = await responseJson(await request(workspace, path));
     const raw = data[kind === 'note' ? 'notes' : 'notebooks'];
-    if (!Array.isArray(raw)) return false;
+    if (data.complete !== true || !Array.isArray(raw)) return false;
     const records = raw.map(item => envelope(kind, item));
     const remote = records.find(item => item.data.id === operation.entityId);
     if (remote) {
@@ -290,6 +296,18 @@ async function reconcile(workspace: string, kind: SyncEntity, remote: Envelope):
   }
   const pending = (await tx.objectStore('outbox').index('by-entity').getAll(current.id)).some(item => item.entity === kind);
   if (pending) { await tx.done; return 'unchanged'; }
+  if (current.unavailable) {
+    if (current.unavailable === 'clean') {
+      await store.put(localData(kind, remote, current.revision + 1) as Note & Notebook);
+      await tx.done; notifyStoreChanged(workspace); return 'pulled';
+    }
+    const { unavailable: _unavailable, ...local } = current;
+    const conflict: SyncConflict = { id: `${kind}:${current.id}`, entity: kind, entityId: current.id, local: current,
+      server: remote.data, serverVersion: remote.version, role: remote.role, detectedAt: new Date().toISOString() };
+    await tx.objectStore('conflicts').put(conflict);
+    await store.put({ ...local, role: remote.role, syncState: 'conflict' } as Note & Notebook);
+    await tx.done; notifyStoreChanged(workspace); return 'conflict';
+  }
   // A stale snapshot must never roll back a newer acknowledged server version.
   if ((current.serverVersion ?? 0) > remote.version) { await tx.done; return 'unchanged'; }
   const changedRemote = current.serverVersion !== remote.version;
@@ -314,37 +332,68 @@ async function reconcile(workspace: string, kind: SyncEntity, remote: Envelope):
   await tx.done;
   return 'unchanged';
 }
+async function markUnavailable(workspace: string, kind: SyncEntity, id: string): Promise<void> {
+  const db = await getWorkspaceDb(workspace);
+  const tx = db.transaction(['notes', 'notebooks', 'attachments', 'outbox'], 'readwrite');
+  const store = kind === 'note' ? tx.objectStore('notes') : tx.objectStore('notebooks');
+  const current = await store.get(id) as Entity | undefined;
+  if (!current || current.serverVersion === null) { await tx.done; return; }
+  const pending = (await tx.objectStore('outbox').index('by-entity').getAll(id)).filter(item => item.entity === kind);
+  const files = kind === 'note' ? await tx.objectStore('attachments').index('by-note').getAll(id) : [];
+  const pendingFiles = files.some(file => file.syncState !== 'synced');
+  const state = current.unavailable ?? (current.syncState === 'synced' && pending.length === 0 && !pendingFiles ? 'clean' : 'unrecovered');
+  const changed = current.role !== 'viewer' || current.syncState !== 'local' || current.unavailable !== state || pending.length > 0;
+  if (changed) await store.put({ ...current, role: 'viewer', syncState: 'local', unavailable: state } as Note & Notebook);
+  for (const operation of pending) await tx.objectStore('outbox').delete(operation.operationId);
+  await tx.done;
+  if (changed) notifyStoreChanged(workspace);
+}
 async function pull(workspace: string, result: SyncResult): Promise<void> {
+  const snapshots: Array<{ kind: SyncEntity; records: Envelope[]; ids: Set<string> }> = [];
+  // Both full responses must be received and validated before applying *any*
+  // missing-record transitions. A network error or malformed/partial response
+  // cannot make cached work appear revoked.
   for (const kind of ['notebook', 'note'] as const) {
     const path = `/api/${kind === 'note' ? 'notes' : 'notebooks'}`;
     const data = await responseJson(await request(workspace, path));
     const raw = data[kind === 'note' ? 'notes' : 'notebooks'];
-    if (!Array.isArray(raw)) throw new Error('Server returned an invalid workspace.');
+    if (data.complete !== true || !Array.isArray(raw)) throw new Error('Server did not provide a complete workspace snapshot.');
     const records = raw.map(item => envelope(kind, item));
-    const seen = new Set<string>();
+    const ids = new Set(records.map(item => item.data.id));
+    if (ids.size !== records.length) throw new Error('Server returned duplicate records.');
+    snapshots.push({ kind, records, ids });
+  }
+  for (const { kind, records } of snapshots) {
     for (const remote of records) {
-      if (seen.has(remote.data.id)) throw new Error('Server returned duplicate records.');
-      seen.add(remote.data.id);
       const outcome = await reconcile(workspace, kind, remote);
       if (outcome === 'pulled') result.pulled += 1;
       if (outcome === 'conflict') result.conflicts += 1;
     }
-    const db = await getWorkspaceDb(workspace);
+  }
+  const db = await getWorkspaceDb(workspace);
+  for (const { kind, ids } of snapshots) {
+    const before = kind === 'note' ? await db.getAll('notes') : await db.getAll('notebooks');
+    for (const item of before) if (item.serverVersion !== null && !ids.has(item.id)) await markUnavailable(workspace, kind, item.id);
     const locals = kind === 'note' ? await db.getAll('notes') : await db.getAll('notebooks');
     const byId = new Map(locals.map(item => [item.id, item]));
     const acknowledgements = kind === 'note' ? new Map((await db.getAll('imports'))
       .filter(item => item.key.startsWith('ack-unavailable-note:')).map(item => [item.key, item.targetId])) : new Map<string, string>();
-    if (locals.some(item => {
-      if (item.serverVersion === null || seen.has(item.id)) return false;
-      if (kind === 'note' && item.role === 'viewer' && item.syncState === 'local') {
+    let needsRecovery = false;
+    for (const item of locals) {
+      if (item.serverVersion === null || ids.has(item.id) || !item.unavailable) continue;
+      if (kind === 'note' && item.unavailable === 'recovered') {
         const copyId = acknowledgements.get(`ack-unavailable-note:${item.id}`);
         const copy = copyId ? byId.get(copyId) : undefined;
-        if (copy && !copy.deletedAt && copy.role === 'owner') return false;
-      }
-      return true;
-    })) {
-      addError(result, `Some previously synced ${kind === 'note' ? 'notes' : 'notebooks'} are no longer accessible on the server; local copies were kept.`);
+        if (!copy || copy.deletedAt || copy.role !== 'owner') {
+          const tx = db.transaction('notes', 'readwrite');
+          const latest = await tx.store.get(item.id);
+          if (latest?.unavailable === 'recovered') await tx.store.put({ ...latest, unavailable: 'unrecovered' });
+          await tx.done; notifyStoreChanged(workspace);
+          needsRecovery = true;
+        }
+      } else if (item.unavailable === 'unrecovered') needsRecovery = true;
     }
+    if (needsRecovery) addError(result, `Some unavailable ${kind === 'note' ? 'notes' : 'notebooks'} have unrecovered local changes; cached copies were kept.`);
   }
 }
 
@@ -496,9 +545,10 @@ async function performSync(workspace: string): Promise<SyncResult> {
   catch (cause) { addError(result, `Could not refresh the server workspace: ${cause instanceof Error ? cause.message : 'network error'}`); }
   await syncAttachments(workspace, csrf, result);
   // Count the outstanding records once, not the same conflict from both pulls.
-  result.conflicts = (await db.getAll('conflicts')).length;
   const remainingNotes = await db.getAll('notes');
   const remainingNotebooks = await db.getAll('notebooks');
+  const visibleIds = new Set([...remainingNotes, ...remainingNotebooks].filter(item => !item.unavailable).map(item => item.id));
+  result.conflicts = (await db.getAll('conflicts')).filter(item => visibleIds.has(item.entityId)).length;
   const remainingOutbox = await db.count('outbox');
   if (remainingOutbox || remainingNotes.some(item => item.syncState === 'dirty') || remainingNotebooks.some(item => item.syncState === 'dirty')) {
     addError(result, 'Some newer changes are still waiting to sync.');

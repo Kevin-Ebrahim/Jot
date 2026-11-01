@@ -255,3 +255,31 @@ test('backup restore rewrites cross-note attachment references without losing th
   assert.equal(await restoredFile.blob.text(), 'cross-note file');
   assert.equal(restoredOther.body, `See attachment:${restoredFile.id}`);
 });
+
+test('an unavailable notebook in trash remains discoverable for explicit local acknowledgement', async () => {
+  await switchWorkspace(unique());
+  const notebook = await jotStore.createNotebook('Trashed shared notebook');
+  const db = await (await import('../src/lib/store')).getWorkspaceDb();
+  await db.put('notebooks', { ...notebook, deletedAt: new Date().toISOString(), role: 'viewer', syncState: 'local', unavailable: 'unrecovered', serverVersion: 1 });
+  assert.equal((await jotStore.listNotebooks()).length, 0);
+  const hidden = (await jotStore.listNotebooks({ includeDeleted: true }))[0];
+  assert.equal(hidden.id, notebook.id); assert.equal(hidden.unavailable, 'unrecovered');
+  await jotStore.acknowledgeUnavailableNotebook(hidden.id, hidden.revision);
+  assert.equal((await jotStore.listNotebooks({ includeDeleted: true }))[0].unavailable, 'recovered');
+});
+
+test('a trashed unavailable note and its files can be explicitly recovered without altering the original', async () => {
+  await switchWorkspace(unique());
+  const note = await jotStore.createNote({ title: 'Unavailable trash', body: 'draft' });
+  const attachment = await jotStore.addAttachment(note.id, new Blob(['recovery bytes']), 'recovery.txt');
+  const linked = await jotStore.updateNote(note.id, { body: `attachment:${attachment.id}` }, note.revision);
+  const db = await (await import('../src/lib/store')).getWorkspaceDb();
+  const deletedAt = new Date().toISOString();
+  await db.put('notes', { ...linked, deletedAt, role: 'viewer', syncState: 'local', unavailable: 'unrecovered', serverVersion: 1 });
+  const copy = await jotStore.copyUnavailableNoteToInbox(note.id, linked.revision);
+  assert.equal(copy.deletedAt, null); assert.equal(copy.notebookId, null); assert.equal(copy.unavailable, undefined);
+  const copiedFile = (await jotStore.listAttachments(copy.id))[0];
+  assert.equal(await copiedFile.blob.text(), 'recovery bytes');
+  assert.equal(copy.body, `attachment:${copiedFile.id}`);
+  assert.equal((await jotStore.getNote(note.id))?.deletedAt, deletedAt);
+});
