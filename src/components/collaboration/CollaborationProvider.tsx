@@ -71,6 +71,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   const switchQueue = useRef<Promise<void>>(Promise.resolve());
   const syncInFlight = useRef<Promise<SyncResult> | null>(null);
   const resolutionInFlight = useRef<Promise<void> | null>(null);
+  const importInFlight = useRef<Promise<number> | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -88,6 +89,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     const transition = switchQueue.current.catch(() => undefined).then(async () => {
       if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
       if (resolutionInFlight.current) await resolutionInFlight.current.catch(() => undefined);
+      if (importInFlight.current) await importInFlight.current.catch(() => undefined);
       if (currentOperation !== operation.current || !mounted.current) return;
       await workspaceRef.current.switchWorkspace(next.user?.id ?? null);
     });
@@ -172,6 +174,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     try {
       if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
       if (resolutionInFlight.current) await resolutionInFlight.current.catch(() => undefined);
+      if (importInFlight.current) await importInFlight.current.catch(() => undefined);
       await workspaceRef.current.prepareWorkspaceSwitch();
       requestStarted = true;
       await request<{ ok: true }>('/api/auth/logout', { method: 'POST', csrfToken: session.csrfToken });
@@ -200,6 +203,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   const syncNow = useCallback(async (): Promise<SyncResult> => {
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before syncing.');
     if (resolutionInFlight.current) throw new Error('Wait for the conflict resolution to finish before syncing.');
+    if (importInFlight.current) throw new Error('Wait for guest notes to finish copying before syncing.');
     if (syncInFlight.current) return syncInFlight.current;
     const pending = workspaceRef.current.syncNow();
     syncInFlight.current = pending;
@@ -243,8 +247,26 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
 
   const importGuestNotes = useCallback(async () => {
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before copying guest notes.');
-    return workspaceRef.current.copyGuestNotesToAccount(session.user.id);
-  }, [session, workspaceReady]);
+    if (importInFlight.current) return importInFlight.current;
+    const userId = session.user.id;
+    const currentOperation = operation.current;
+    const pending = (async () => {
+      // Do not let a sync started before the copy make the new records look
+      // synchronized. Wait for it, then copy atomically, then start a fresh sync.
+      if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
+      if (currentOperation !== operation.current) throw new Error('The account changed before copying began.');
+      return workspaceRef.current.copyGuestNotesToAccount(userId);
+    })();
+    importInFlight.current = pending;
+    try {
+      const count = await pending;
+      if (importInFlight.current === pending) importInFlight.current = null;
+      if (currentOperation === operation.current && mounted.current) void syncNow().catch(() => undefined);
+      return count;
+    } finally {
+      if (importInFlight.current === pending) importInFlight.current = null;
+    }
+  }, [session, workspaceReady, syncNow]);
 
   const listConflicts = useCallback(async () => {
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before reviewing conflicts.');
