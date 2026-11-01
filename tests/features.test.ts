@@ -220,6 +220,7 @@ test("audio decoding stays local and transcription worker cancellation terminate
     assert.ok(last);
     const worker: FakeWorker = last;
     assert.ok(worker.samples instanceof Float32Array);
+    await assert.rejects(transcribeAudioOnDevice(file), /Another recording/);
     controller.abort();
     await assert.rejects(pending, { name: "AbortError" });
     assert.equal(worker.terminated, 1);

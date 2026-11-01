@@ -39,10 +39,16 @@ self.addEventListener('fetch', (event) => {
     event.respondWith((async () => {
       const cache = await caches.open(CACHE);
       const cached = await cache.match(request);
-      if (cached) return cached;
-      const response = await fetch(request);
-      if (response.ok) await cache.put(request, response.clone());
-      return response;
+      const response = cached || await fetch(request);
+      if (!cached && response.ok) await cache.put(request, response.clone());
+      // A cached/fetched Response has a fragment-free response.url. Turbopack
+      // puts worker bootstrap parameters in the original URL fragment; returning
+      // that response directly can replace the worker's URL and lose the config.
+      // A fresh Response has an empty URL, so the browser retains the request URL.
+      const isWorker = request.destination === 'worker' || /\/turbopack-worker-[^/]+\.js$/.test(url.pathname);
+      return isWorker && response.ok
+        ? new Response(response.body, { status: response.status, statusText: response.statusText, headers: response.headers })
+        : response;
     })());
   }
 });

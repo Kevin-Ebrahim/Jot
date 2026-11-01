@@ -110,45 +110,54 @@ export async function decodeAudioToMono16k(file: Blob, signal?: AbortSignal): Pr
   return mono;
 }
 
+let activeTranscription: symbol | null = null;
+
 /** A disposable worker owns model download and inference; Stop terminates it. */
 export async function transcribeAudioOnDevice(file: Blob, onProgress?: TranscriptionProgress, signal?: AbortSignal): Promise<string> {
   checkAbort(signal);
-  onProgress?.("Checking and decoding audio locally…");
-  const samples = await decodeAudioToMono16k(file, signal);
-  checkAbort(signal);
-  onProgress?.("Loading the on-device speech model…");
-  const worker = new Worker(new URL("./transcription-worker.ts", import.meta.url), { type: "module" });
-  return new Promise<string>((resolve, reject) => {
-    let settled = false;
-    let timeout: ReturnType<typeof setTimeout>;
-    const finish = (text?: string, error?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", cancel);
-      worker.onmessage = null; worker.onerror = null; worker.onmessageerror = null;
-      worker.terminate();
-      if (error) reject(error); else resolve(text || "");
-    };
-    const cancel = () => finish(undefined, abortError());
-    const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(() => finish(undefined, new Error("Transcription timed out. Check your connection or try a shorter recording.")), 8 * 60_000);
-    };
-    worker.onmessage = ({ data }: MessageEvent<{ type: "progress" | "done" | "error"; message?: string; text?: string }>) => {
-      if (settled) return;
-      if (data.type === "progress") { resetTimeout(); onProgress?.(data.message || "Transcribing on this device…"); }
-      else if (data.type === "done") finish(data.text || "");
-      else if (data.type === "error") finish(undefined, new Error(data.message || "Transcription failed."));
-    };
-    worker.onerror = (event) => finish(undefined, new Error(event.message || "Couldn’t start on-device transcription."));
-    worker.onmessageerror = () => finish(undefined, new Error("Couldn’t read the transcription result."));
-    signal?.addEventListener("abort", cancel, { once: true });
-    resetTimeout();
-    if (signal?.aborted) cancel();
-    else {
-      try { worker.postMessage({ samples }, [samples.buffer as ArrayBuffer]); }
-      catch (error) { finish(undefined, error instanceof Error ? error : new Error("Couldn’t start transcription.")); }
-    }
-  });
+  if (activeTranscription) throw new Error("Another recording is being transcribed in this tab. Wait for it to finish or stop it first.");
+  const job = Symbol("transcription");
+  activeTranscription = job;
+  try {
+    onProgress?.("Checking and decoding audio locally…");
+    const samples = await decodeAudioToMono16k(file, signal);
+    checkAbort(signal);
+    onProgress?.("Loading the on-device speech model…");
+    const worker = new Worker(new URL("./transcription-worker.ts", import.meta.url), { type: "module" });
+    return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let timeout: ReturnType<typeof setTimeout>;
+      const finish = (text?: string, error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", cancel);
+        worker.onmessage = null; worker.onerror = null; worker.onmessageerror = null;
+        worker.terminate();
+        if (error) reject(error); else resolve(text || "");
+      };
+      const cancel = () => finish(undefined, abortError());
+      const resetTimeout = () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => finish(undefined, new Error("Transcription timed out. Check your connection or try a shorter recording.")), 8 * 60_000);
+      };
+      worker.onmessage = ({ data }: MessageEvent<{ type: "progress" | "done" | "error"; message?: string; text?: string }>) => {
+        if (settled) return;
+        if (data.type === "progress") { resetTimeout(); onProgress?.(data.message || "Transcribing on this device…"); }
+        else if (data.type === "done") finish(data.text || "");
+        else if (data.type === "error") finish(undefined, new Error(data.message || "Transcription failed."));
+      };
+      worker.onerror = (event) => finish(undefined, new Error(event.message || "Couldn’t start on-device transcription."));
+      worker.onmessageerror = () => finish(undefined, new Error("Couldn’t read the transcription result."));
+      signal?.addEventListener("abort", cancel, { once: true });
+      resetTimeout();
+      if (signal?.aborted) cancel();
+      else {
+        try { worker.postMessage({ samples }, [samples.buffer as ArrayBuffer]); }
+        catch (error) { finish(undefined, error instanceof Error ? error : new Error("Couldn’t start transcription.")); }
+      }
+    });
+  } finally {
+    if (activeTranscription === job) activeTranscription = null;
+  }
 }

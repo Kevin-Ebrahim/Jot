@@ -9,7 +9,7 @@ test('offline worker precaches shell and assets, serves them offline, and ignore
   let online = true;
   let activated = false;
   const base = 'https://jot.example';
-  const key = (input: string | Request) => new URL(typeof input === 'string' ? input : input.url, base).href;
+  const key = (input: string | Request) => { const url = new URL(typeof input === 'string' ? input : input.url, base); url.hash = ''; return url.href; };
   const network = async (input: string | Request) => {
     if (!online) throw new TypeError('offline');
     const url = new URL(typeof input === 'string' ? input : input.url, base);
@@ -24,7 +24,11 @@ test('offline worker precaches shell and assets, serves them offline, and ignore
       for (const [url, response] of staged) contents.set(url, response.clone());
     },
     async put(url: string | Request, response: Response) { contents.set(key(url), response.clone()); },
-    async match(url: string | Request) { return contents.get(key(url))?.clone(); },
+    async match(url: string | Request) {
+      const response = contents.get(key(url))?.clone();
+      if (response) Object.defineProperty(response, 'url', { value: key(url) });
+      return response;
+    },
   };
   const self = { location: { origin: base }, addEventListener(name: string, handler: (event: any) => void) { handlers[name] = handler; },
     skipWaiting() { activated = true; }, clients: { async claim() {} } };
@@ -42,6 +46,12 @@ test('offline worker precaches shell and assets, serves them offline, and ignore
   assert.equal(await (await response!).text(), '<html>Jot shell</html>');
   handlers.fetch({ request: { method: 'GET', url: `${base}/_next/static/a.js`, mode: 'no-cors' }, respondWith(value: Promise<Response>) { response = value; } });
   assert.equal(await (await response!).text(), 'asset:/_next/static/a.js');
+  await cache.put('/_next/static/turbopack-worker-test.js', new Response('worker bootstrap', { headers: { 'Content-Type': 'application/javascript' } }));
+  handlers.fetch({ request: { method: 'GET', url: `${base}/_next/static/turbopack-worker-test.js#params=abc`, mode: 'same-origin', destination: 'worker' }, respondWith(value: Promise<Response>) { response = value; } });
+  const workerResponse = await response!;
+  assert.equal(workerResponse.url, ''); // retain the request's fragment, rather than a cached response URL
+  assert.equal(workerResponse.headers.get('Content-Type'), 'application/javascript');
+  assert.equal(await workerResponse.text(), 'worker bootstrap');
   let intercepted = false;
   handlers.fetch({ request: { method: 'GET', url: `${base}/api/notes`, mode: 'cors' }, respondWith() { intercepted = true; } });
   assert.equal(intercepted, false);

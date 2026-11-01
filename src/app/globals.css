@@ -354,3 +354,11 @@ code, pre, kbd { font-family: var(--font-mono); }
 .note-row:hover .note-row-date, .note-row:hover .note-row-bottom,
 .note-row.selected .note-row-date, .note-row.selected .note-row-bottom,
 .nav-item:hover .nav-count, .nav-item.active .nav-count { color: var(--muted); }
+.account-attention { width: 100%; border: 0; border-radius: 5px; background: transparent; color: var(--danger); text-align: left; }
+.account-attention:hover { background: var(--surface-hover); }
+.account-attention-mobile { display: none; }
+@media (max-width: 820px) {
+  .account-attention-mobile { position: fixed; z-index: 20; left: 12px; right: 12px; bottom: 12px; display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); box-shadow: var(--shadow); color: var(--text); font-size: 11px; }
+  .account-attention-mobile span { flex: 1; }
+  .account-attention-mobile.has-app-notice { bottom: 70px; }
+}

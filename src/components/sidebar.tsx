@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import {
-  Archive, BookOpen, CheckSquare2, ChevronDown, CircleHelp, FileText, Folder,
+  CheckSquare2, CircleAlert, FileText, Folder,
   Inbox, LayoutTemplate, MoreHorizontal, Plus, Search, Settings2, Sparkles,
   Star, Trash2, UserRound, Zap,
 } from 'lucide-react';
@@ -15,6 +15,7 @@ type Props = {
   notebooks: Notebook[];
   counts: { all: number; inbox: number; starred: number; tasks: number; notebooks: Record<string, number> };
   online: boolean;
+  accountAttention: string | null;
   open: boolean;
   onClose: () => void;
   onNavigate: (view: View) => void;
@@ -28,7 +29,7 @@ type Props = {
   onAccount: () => void;
 };
 
-export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavigate, onNew, onCapture, onSearch, onCreateNotebook, onRenameNotebook, onShareNotebook, onDeleteNotebook, onAccount }: Props) {
+export function Sidebar({ view, notebooks, counts, online, accountAttention, open, onClose, onNavigate, onNew, onCapture, onSearch, onCreateNotebook, onRenameNotebook, onShareNotebook, onDeleteNotebook, onAccount }: Props) {
   const [notebookMenu, setNotebookMenu] = useState<string | null>(null);
   const modifier = useShortcutModifier();
   useEffect(() => {
@@ -84,7 +85,7 @@ export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavi
       <div className="sidebar-footer">
         <button className="nav-item" onClick={onAccount}><UserRound size={16} /><span className="label">Account &amp; sync</span></button>
         <button className={`nav-item ${view.kind === 'settings' ? 'active' : ''}`} onClick={() => navigate({ kind: 'settings' })}><Settings2 size={16} /><span className="label">Settings</span></button>
-        <div className="connection-line"><span className={`status-dot ${online ? '' : 'offline'}`} />{online ? 'Stored on this device' : 'Offline · changes stay here'}</div>
+        {accountAttention ? <button className="connection-line account-attention" onClick={onAccount}><CircleAlert size={13} />{accountAttention}</button> : <div className="connection-line"><span className={`status-dot ${online ? '' : 'offline'}`} />{online ? 'Stored on this device' : 'Offline · changes stay here'}</div>}
       </div>
     </aside>
   </>;
