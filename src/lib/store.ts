@@ -341,6 +341,32 @@ async function copyUnavailableNoteToInbox(sourceId: string, expectedRevision: nu
   });
 }
 
+/** A successful, explicitly reviewed recovery can acknowledge a missing share without deleting it. */
+async function acknowledgeUnavailableNote(sourceId: string, expectedRevision: number, recoveredCopyId: string): Promise<void> {
+  const workspace = getWorkspaceId();
+  if (!workspace) throw new Error('Recovery requires an account workspace.');
+  await withWorkspaceLock(workspace, async () => {
+    if (getWorkspaceId() !== workspace) throw new Error('Workspace changed; acknowledgement was cancelled.');
+    const db = await getWorkspaceDb(workspace);
+    const tx = db.transaction(['notes', 'imports'], 'readwrite');
+    const notes = tx.objectStore('notes'), imports = tx.objectStore('imports');
+    const source = await notes.get(sourceId), copy = await notes.get(recoveredCopyId);
+    if (!source || source.revision !== expectedRevision) {
+      if (source) throw new ConflictError(source);
+      throw new Error('The original local note no longer exists.');
+    }
+    if (source.role !== 'viewer' || source.syncState !== 'local') { await tx.done; return; }
+    if (!copy || copy.deletedAt || copy.role !== 'owner' || copy.id === source.id) throw new Error('The recovered personal copy is not available.');
+    const ledger = await imports.getAll();
+    if (!ledger.some(item => item.key.startsWith(`recovery:${source.id}:${source.revision}:`) && item.targetId === copy.id)) {
+      throw new Error('The personal copy does not match this recovery.');
+    }
+    await imports.put({ key: `ack-unavailable-note:${source.id}`, targetId: copy.id });
+    await tx.done;
+    notifyStoreChanged(workspace);
+  });
+}
+
 async function listNotebooks(): Promise<Notebook[]> {
   return (await (await getWorkspaceDb()).getAll('notebooks')).filter(n => !n.deletedAt).sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -705,7 +731,7 @@ async function copyGuestNotesToAccount(userId: string): Promise<number> {
 
 
 export const jotStore = {
-  listNotes, getNote, createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox,
+  listNotes, getNote, createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox, acknowledgeUnavailableNote,
   listNotebooks, createNotebook, renameNotebook, deleteNotebook,
   listAttachments, addAttachment, deleteAttachment,
   exportBackup, importBackup, exportMarkdownZip, switchWorkspace, copyGuestNotesToAccount,

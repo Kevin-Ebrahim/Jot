@@ -369,3 +369,27 @@ for (const operation of ['PUT', 'DELETE'] as const) {
     }
   });
 }
+
+test('a confirmed personal recovery acknowledges a revoked original without deleting it', async () => {
+  const userId = crypto.randomUUID(), server = fakeServer(userId); globalThis.fetch = server.handler;
+  const noteId = crypto.randomUUID(), timestamp = new Date().toISOString();
+  server.notes.set(noteId, { data: { id: noteId, title: 'Shared', body: 'server', tags: [], notebookId: null,
+    createdAt: timestamp, updatedAt: timestamp, deletedAt: null, pinned: false }, version: 1, role: 'editor' });
+  await switchWorkspace(userId); await syncWorkspace();
+  const source = (await jotStore.getNote(noteId))!;
+  await jotStore.updateNote(source.id, { body: 'preserved local draft' }, source.revision);
+  server.rejectNextWrite(); await syncWorkspace(); server.revoke(noteId); await syncWorkspace();
+  const unavailable = (await jotStore.getNote(noteId))!;
+  const recovered = await jotStore.copyUnavailableNoteToInbox(noteId, unavailable.revision, { body: 'reviewed visible draft' });
+  const before = await syncWorkspace();
+  assert.ok(before.errors.some(message => /no longer accessible/i.test(message)));
+  await jotStore.acknowledgeUnavailableNote(noteId, unavailable.revision, recovered.id);
+  const after = await syncWorkspace();
+  assert.deepEqual(after.errors, []);
+  assert.equal((await jotStore.getNote(noteId))?.body, 'preserved local draft');
+  assert.equal((await jotStore.getNote(recovered.id))?.body, 'reviewed visible draft');
+  const latest = (await jotStore.getNote(recovered.id))!;
+  await jotStore.trashNote(latest.id, latest.revision);
+  const trashed = await syncWorkspace();
+  assert.ok(trashed.errors.some(message => /no longer accessible/i.test(message)));
+});

@@ -4,8 +4,9 @@ import { HttpError } from './errors';
 import type { PublicUser } from './auth';
 import type { Role, ServerNote, ServerNotebook, ShareRole } from './validation';
 import { cipherFor, type ContentCipher } from './content-crypto';
+import { contentBytes, enforceContentQuota } from './quota';
 
-interface RecordRow { id: string; owner_id: string; version: number; data_json: string; deleted_at: string | null }
+interface RecordRow { id: string; owner_id: string; version: number; data_json: string; deleted_at: string | null; content_bytes: number }
 interface NoteRow extends RecordRow { notebook_id: string | null }
 interface RoleRow extends RecordRow { role: Role }
 interface NoteRoleRow extends NoteRow { role: Role }
@@ -138,14 +139,16 @@ export class Repository {
         if (existing && notebook.owner_id !== existing.owner_id) throw new HttpError(403, 'Notes cannot be moved between owners');
         if (!existing) ownerId = notebook.owner_id;
       }
+      const bytes = contentBytes('note', input);
+      enforceContentQuota(this.db, ownerId, 'note', existing?.content_bytes ?? null, bytes);
       const version = (existing?.version || 0) + 1;
       const stored = this.cipher.sealText(JSON.stringify(input), `note:${input.id}`);
       if (existing) {
-        this.db.prepare('UPDATE notes SET notebook_id = ?, version = ?, data_json = ?, deleted_at = ? WHERE id = ?')
-          .run(input.notebookId, version, stored, input.deletedAt, input.id);
+        this.db.prepare('UPDATE notes SET notebook_id = ?, version = ?, data_json = ?, deleted_at = ?, content_bytes = ? WHERE id = ?')
+          .run(input.notebookId, version, stored, input.deletedAt, bytes, input.id);
       } else {
-        this.db.prepare('INSERT INTO notes (id, owner_id, notebook_id, version, data_json, deleted_at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(input.id, ownerId, input.notebookId, version, stored, input.deletedAt);
+        this.db.prepare('INSERT INTO notes (id, owner_id, notebook_id, version, data_json, deleted_at, content_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(input.id, ownerId, input.notebookId, version, stored, input.deletedAt, bytes);
       }
       const updated = this.noteRow(userId, input.id);
       if (!updated) throw new HttpError(403, 'No access to note');
@@ -175,14 +178,16 @@ export class Repository {
       if (existing && existing.deleted_at !== input.deletedAt && current?.role !== 'owner') {
         throw new HttpError(403, 'Only the owner can trash or restore a notebook');
       }
+      const bytes = contentBytes('notebook', input);
+      enforceContentQuota(this.db, existing?.owner_id || userId, 'notebook', existing?.content_bytes ?? null, bytes);
       const version = (existing?.version || 0) + 1;
       const stored = this.cipher.sealText(JSON.stringify(input), `notebook:${input.id}`);
       if (existing) {
-        this.db.prepare('UPDATE notebooks SET version = ?, data_json = ?, deleted_at = ? WHERE id = ?')
-          .run(version, stored, input.deletedAt, input.id);
+        this.db.prepare('UPDATE notebooks SET version = ?, data_json = ?, deleted_at = ?, content_bytes = ? WHERE id = ?')
+          .run(version, stored, input.deletedAt, bytes, input.id);
       } else {
-        this.db.prepare('INSERT INTO notebooks (id, owner_id, version, data_json, deleted_at) VALUES (?, ?, ?, ?, ?)')
-          .run(input.id, userId, version, stored, input.deletedAt);
+        this.db.prepare('INSERT INTO notebooks (id, owner_id, version, data_json, deleted_at, content_bytes) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(input.id, userId, version, stored, input.deletedAt, bytes);
       }
       // A deleted notebook does not delete notes. Detach them atomically and
       // bump each note's version so stale offline changes conflict safely.
@@ -239,10 +244,12 @@ export class Repository {
       const row = this.noteRow(user.id, noteId);
       if (!row) throw new HttpError(404, 'Note not found');
       if (row.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+      const bytes = contentBytes('comment', body);
+      enforceContentQuota(this.db, row.owner_id, 'comment', null, bytes);
       const now = new Date().toISOString();
       const comment = { id: randomUUID(), noteId, author: user, body, createdAt: now, updatedAt: now };
-      this.db.prepare('INSERT INTO comments (id, note_id, author_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(comment.id, noteId, user.id, this.cipher.sealText(body, `comment:${comment.id}`), now, now);
+      this.db.prepare('INSERT INTO comments (id, note_id, author_id, body, content_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(comment.id, noteId, user.id, this.cipher.sealText(body, `comment:${comment.id}`), bytes, now, now);
       return comment;
     });
   }

@@ -54,7 +54,13 @@ export function trustedClientIp(req: Request): string | undefined {
   if (!header) return undefined;
   if (!/^[a-z0-9-]{1,64}$/i.test(header)) throw new HttpError(500, 'Invalid trusted proxy configuration');
   const value = req.headers.get(header)?.trim();
-  if (!value || !isIP(value)) throw new HttpError(400, 'Trusted proxy IP header is missing or invalid');
+  const family = value ? isIP(value) : 0;
+  if (!value || !family) throw new HttpError(400, 'Trusted proxy IP header is missing or invalid');
+  // Normalize equivalent IPv6 spellings so they do not evade the same bucket.
+  if (family === 6) {
+    try { return new URL(`http://[${value}]/`).hostname.slice(1, -1); }
+    catch { throw new HttpError(400, 'Trusted proxy IP header is missing or invalid'); }
+  }
   return value;
 }
 function makeSession(db: DatabaseSync, user: PublicUser): Session {
@@ -71,7 +77,9 @@ export async function register(db: DatabaseSync, rawEmail: unknown, rawPassword:
   if (process.env.JOT_ALLOW_REGISTRATION === 'false') throw new HttpError(403, 'Registration is disabled');
   const email = validate.email(rawEmail);
   const password = validate.password(rawPassword);
-  checkAttempts(`register:${email}`, 5, 10 * 60_000);
+  // Only explicitly trusted proxy-supplied IPs participate in the key. With no
+  // trusted IP, the shared per-account bucket is the conservative fallback.
+  checkAttempts(`register:${JSON.stringify([email, clientIp ?? null])}`, 5, 10 * 60_000);
   if (clientIp) checkAttempts(`register-ip:${clientIp}`, 20, 10 * 60_000);
   const salt = randomBytes(16).toString('hex');
   const passwordHash = (await scrypt(password, salt)).toString('hex');
@@ -100,7 +108,7 @@ export async function login(db: DatabaseSync, rawEmail: unknown, rawPassword: un
   const email = validate.email(rawEmail);
   // A login accepts legacy-length strings too, but still bounds work and input.
   const password = validate.text(rawPassword, 'password', 256, false);
-  checkAttempts(`login:${email}`, 10, 10 * 60_000);
+  checkAttempts(`login:${JSON.stringify([email, clientIp ?? null])}`, 10, 10 * 60_000);
   if (clientIp) checkAttempts(`login-ip:${clientIp}`, 100, 10 * 60_000);
   const row = db.prepare('SELECT id, email, password_salt, password_hash FROM users WHERE email = ?').get(email) as unknown as UserRow | undefined;
   const derived = await scrypt(password, row?.password_salt || '00000000000000000000000000000000');

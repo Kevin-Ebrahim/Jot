@@ -11,6 +11,7 @@ import { HttpError } from '../src/server/errors';
 import { requireSameOrigin } from '../src/server/http';
 import { Repository } from '../src/server/repository';
 import { date } from '../src/server/validation';
+import { contentBytes } from '../src/server/quota';
 import type { ServerNote, ServerNotebook } from '../src/server/validation';
 
 const now = '2026-11-01T12:00:00.000Z';
@@ -163,6 +164,7 @@ test('calendar dates must round-trip exactly and proxy IP headers are opt-in', (
   process.env.JOT_TRUST_PROXY_IP_HEADER = 'x-real-ip';
   try {
     assert.equal(trustedClientIp(req), '203.0.113.42');
+    assert.equal(trustedClientIp(new Request(req.url, { headers: { 'x-real-ip': '2001:0db8:0000:0:0:0:0:1' } })), '2001:db8::1');
     assert.throws(() => trustedClientIp(new Request(req.url, { headers: { 'x-real-ip': '203.0.113.42, 198.51.100.1' } })), errorStatus(400));
     assert.throws(() => trustedClientIp(new Request(req.url)), errorStatus(400));
   } finally { delete process.env.JOT_TRUST_PROXY_IP_HEADER; }
@@ -262,6 +264,11 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     const large = note({ body: '\u0000'.repeat(250_000) });
     const largeCtx = { params: Promise.resolve({ id: large.id }) };
     assert.equal((await noteRoute.PUT(req(`/api/notes/${large.id}`, 'PUT', { baseVersion: 0, operationId: randomUUID(), note: large }, alice.cookie, alice.csrfToken), largeCtx)).status, 200);
+    process.env.JOT_MAX_USER_NOTES = '2';
+    const blocked = note(); const blockedCtx = { params: Promise.resolve({ id: blocked.id }) };
+    assert.equal((await noteRoute.PUT(req(`/api/notes/${blocked.id}`, 'PUT', { baseVersion: 0, operationId: randomUUID(), note: blocked }, alice.cookie, alice.csrfToken), blockedCtx)).status, 413);
+    assert.equal((await (await notesRoute.GET(req('/api/notes', 'GET', undefined, alice.cookie))).json()).notes.length, 2);
+    delete process.env.JOT_MAX_USER_NOTES;
     assert.deepEqual((await (await notesRoute.GET(req('/api/notes', 'GET', undefined, bob.cookie))).json()).notes, []);
     const share = await shareRoute.POST(req(`/api/notes/${item.id}/shares`, 'POST', { email: bob.user.email, role: 'viewer' }, alice.cookie, alice.csrfToken), ctx);
     assert.equal(share.status, 200);
@@ -277,6 +284,7 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     delete holder.__jotDatabase;
     delete process.env.JOT_DATA_DIR;
     delete process.env.JOT_ALLOW_REGISTRATION;
+    delete process.env.JOT_MAX_USER_NOTES;
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -537,4 +545,119 @@ test('attachment mutations reject stale note versions even when an upload finish
     holder.__jotDatabase?.close(); delete holder.__jotDatabase; delete process.env.JOT_DATA_DIR;
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('trusted proxy IPs isolate account login throttles; untrusted mode keeps the shared fallback', async () => {
+  const db = openDatabase(':memory:');
+  try {
+    const account = await register(db, 'ip-limits@example.test', 'a sufficiently long password');
+    for (let i = 0; i < 10; i++) await assert.rejects(login(db, account.user.email, 'incorrect password', '203.0.113.1'), errorStatus(401));
+    await assert.rejects(login(db, account.user.email, 'a sufficiently long password', '203.0.113.1'), errorStatus(429));
+    assert.equal((await login(db, account.user.email, 'a sufficiently long password', '203.0.113.2')).user.id, account.user.id);
+    for (let i = 0; i < 10; i++) await assert.rejects(login(db, account.user.email, 'incorrect password', '2001:db8::1'), errorStatus(401));
+    // Structured keys cannot collide when an email itself contains a colon.
+    await assert.rejects(login(db, `${account.user.email}:2001`, 'incorrect password', 'db8::1'), errorStatus(401));
+    for (let i = 0; i < 10; i++) await assert.rejects(login(db, account.user.email, 'incorrect password'), errorStatus(401));
+    await assert.rejects(login(db, account.user.email, 'a sufficiently long password'), errorStatus(429));
+  } finally { db.close(); }
+});
+
+test('owner content record quotas include trash, shared editors and comments', () => {
+  const db = openDatabase(':memory:');
+  process.env.JOT_MAX_USER_NOTES = '1';
+  process.env.JOT_MAX_USER_NOTEBOOKS = '1';
+  process.env.JOT_MAX_USER_COMMENTS = '1';
+  try {
+    const owner = user(db, 'records-owner@example.test');
+    const editor = user(db, 'records-editor@example.test');
+    const other = user(db, 'records-other@example.test');
+    const repo = new Repository(db);
+    const book = notebook();
+    repo.putNotebook(owner.id, randomUUID(), 0, book);
+    const trashedBook = repo.putNotebook(owner.id, randomUUID(), 1, { ...book, deletedAt: now });
+    assert.throws(() => repo.putNotebook(owner.id, randomUUID(), 0, notebook()), errorStatus(413));
+    repo.putNotebook(owner.id, randomUUID(), trashedBook.version, book);
+    const item = note({ notebookId: book.id });
+    repo.putNote(owner.id, randomUUID(), 0, item);
+    const trashed = repo.putNote(owner.id, randomUUID(), 1, { ...item, deletedAt: now });
+    assert.throws(() => repo.putNote(owner.id, randomUUID(), 0, note()), errorStatus(413));
+    repo.putNote(owner.id, randomUUID(), trashed.version, item);
+    repo.changeShare('notebook', owner.id, book.id, editor.email, 'editor');
+    assert.throws(() => repo.putNote(editor.id, randomUUID(), 0, note({ notebookId: book.id })), errorStatus(413));
+    const comment = repo.addComment(editor, item.id, 'one');
+    assert.throws(() => repo.addComment(owner, item.id, 'two'), errorStatus(413));
+    repo.deleteComment(owner.id, item.id, comment.id);
+    assert.equal(repo.addComment(owner, item.id, 'two').body, 'two');
+    // Limits are per owner, not a global lockout.
+    assert.equal(repo.putNote(other.id, randomUUID(), 0, note()).version, 1);
+  } finally {
+    db.close(); delete process.env.JOT_MAX_USER_NOTES; delete process.env.JOT_MAX_USER_NOTEBOOKS; delete process.env.JOT_MAX_USER_COMMENTS;
+  }
+});
+
+test('content byte quota rejects growth atomically and allows shrink or trash without loss', () => {
+  const db = openDatabase(':memory:');
+  try {
+    const owner = user(db, 'bytes-owner@example.test');
+    const repo = new Repository(db);
+    const item = note({ title: '📓', body: '\u0000😀', tags: ['é'] });
+    const initialBytes = contentBytes('note', item);
+    assert.equal(initialBytes, Buffer.byteLength(JSON.stringify({ title: item.title, body: item.body, tags: item.tags }), 'utf8'));
+    process.env.JOT_MAX_USER_CONTENT_BYTES = String(initialBytes);
+    repo.putNote(owner.id, randomUUID(), 0, item);
+    const op = randomUUID();
+    assert.throws(() => repo.putNote(owner.id, op, 1, { ...item, body: `${item.body}x` }), errorStatus(413));
+    assert.equal(repo.listNotes(owner.id)[0].version, 1);
+    assert.equal(repo.listNotes(owner.id)[0].note.body, item.body);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM operations WHERE operation_id=?').get(op)?.count, 0);
+    const deleted = repo.putNote(owner.id, randomUUID(), 1, { ...item, deletedAt: now });
+    assert.equal(deleted.version, 2); // trash metadata does not consume content bytes
+    process.env.JOT_MAX_USER_CONTENT_BYTES = '1'; // lowering the limit never destroys existing data
+    const smaller = repo.putNote(owner.id, randomUUID(), 2, { ...item, title: '', body: '', tags: [], deletedAt: now });
+    assert.equal(smaller.version, 3);
+    assert.throws(() => repo.putNote(owner.id, randomUUID(), 3, { ...smaller.note, body: 'growth' }), errorStatus(413));
+    assert.equal(repo.listNotes(owner.id)[0].note.body, '');
+  } finally { db.close(); delete process.env.JOT_MAX_USER_CONTENT_BYTES; }
+});
+
+test('content-byte accounting migrates existing plaintext and encrypted databases', () => {
+  for (const encrypted of [false, true]) {
+    const directory = mkdtempSync(path.join(tmpdir(), 'jot-quota-migration-'));
+    const filename = path.join(directory, 'jot.sqlite');
+    let db: DatabaseSync | undefined;
+    if (encrypted) process.env.JOT_ENCRYPTION_KEY = '77'.repeat(32);
+    try {
+      db = openDatabase(filename);
+      const owner = user(db, `quota-migration-${encrypted}@example.test`);
+      const repo = new Repository(db);
+      const book = notebook({ name: 'Notebook 📚' });
+      repo.putNotebook(owner.id, randomUUID(), 0, book);
+      const item = note({ title: 'Title é', body: 'body 😀', notebookId: book.id });
+      repo.putNote(owner.id, randomUUID(), 0, item);
+      const comment = repo.addComment(owner, item.id, 'comment é');
+      db.exec('ALTER TABLE notes DROP COLUMN content_bytes; ALTER TABLE notebooks DROP COLUMN content_bytes; ALTER TABLE comments DROP COLUMN content_bytes');
+      db.close(); db = undefined;
+      db = openDatabase(filename);
+      assert.equal((db.prepare('SELECT content_bytes FROM notes WHERE id=?').get(item.id) as { content_bytes: number }).content_bytes, contentBytes('note', item));
+      assert.equal((db.prepare('SELECT content_bytes FROM notebooks WHERE id=?').get(book.id) as { content_bytes: number }).content_bytes, contentBytes('notebook', book));
+      assert.equal((db.prepare('SELECT content_bytes FROM comments WHERE id=?').get(comment.id) as { content_bytes: number }).content_bytes, contentBytes('comment', 'comment é'));
+      assert.equal(new Repository(db).listNotes(owner.id)[0].note.body, item.body);
+    } finally { db?.close(); delete process.env.JOT_ENCRYPTION_KEY; rmSync(directory, { recursive: true, force: true }); }
+  }
+});
+
+test('comment bytes share the note owner content quota and deletion releases space', () => {
+  const db = openDatabase(':memory:');
+  try {
+    const owner = user(db, 'comment-bytes@example.test');
+    const repo = new Repository(db);
+    const item = note();
+    repo.putNote(owner.id, randomUUID(), 0, item);
+    process.env.JOT_MAX_USER_CONTENT_BYTES = String(contentBytes('note', item) + 3);
+    const comment = repo.addComment(owner, item.id, 'abc');
+    assert.throws(() => repo.addComment(owner, item.id, 'x'), errorStatus(413));
+    assert.equal(repo.listComments(owner.id, item.id).length, 1);
+    repo.deleteComment(owner.id, item.id, comment.id);
+    assert.equal(repo.addComment(owner, item.id, 'xyz').body, 'xyz');
+  } finally { db.close(); delete process.env.JOT_MAX_USER_CONTENT_BYTES; }
 });

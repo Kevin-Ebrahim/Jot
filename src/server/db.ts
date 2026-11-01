@@ -1,7 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { initializeCipher } from './content-crypto';
+import { cipherFor, initializeCipher } from './content-crypto';
+import { contentBytes } from './quota';
+import type { ServerNote, ServerNotebook } from './validation';
 
 /**
  * The database is deliberately local: no hosted account or network service is
@@ -44,7 +46,8 @@ export function openDatabase(filename: string): DatabaseSync {
       owner_id TEXT NOT NULL REFERENCES users(id),
       version INTEGER NOT NULL,
       data_json TEXT NOT NULL,
-      deleted_at TEXT
+      deleted_at TEXT,
+      content_bytes INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS notes (
       id TEXT PRIMARY KEY,
@@ -52,7 +55,8 @@ export function openDatabase(filename: string): DatabaseSync {
       notebook_id TEXT REFERENCES notebooks(id),
       version INTEGER NOT NULL,
       data_json TEXT NOT NULL,
-      deleted_at TEXT
+      deleted_at TEXT,
+      content_bytes INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS notes_notebook ON notes(notebook_id);
     CREATE TABLE IF NOT EXISTS notebook_shares (
@@ -72,6 +76,7 @@ export function openDatabase(filename: string): DatabaseSync {
       note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
       author_id TEXT NOT NULL REFERENCES users(id),
       body TEXT NOT NULL,
+      content_bytes INTEGER NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -98,6 +103,31 @@ export function openDatabase(filename: string): DatabaseSync {
       PRIMARY KEY(user_id, operation_id)
     );
   `);
+  // Existing databases acquire logical content-byte accounting atomically.
+  // Decrypt before measuring so encrypted and plaintext workspaces have the
+  // same quota semantics; never rewrite the user's content during migration.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const cipher = cipherFor(db);
+    for (const kind of ['note', 'notebook', 'comment'] as const) {
+      const table = kind === 'note' ? 'notes' : kind === 'notebook' ? 'notebooks' : 'comments';
+      const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
+      if (columns.some((column) => column.name === 'content_bytes')) continue;
+      db.exec(`ALTER TABLE ${table} ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0`);
+      const field = kind === 'comment' ? 'body' : 'data_json';
+      const rows = db.prepare(`SELECT id, ${field} AS content FROM ${table}`).all() as unknown as Array<{ id: string; content: string }>;
+      const update = db.prepare(`UPDATE ${table} SET content_bytes = ? WHERE id = ?`);
+      for (const row of rows) {
+        const plaintext = cipher.openText(row.content, `${kind}:${row.id}`);
+        const bytes = kind === 'note' ? contentBytes('note', JSON.parse(plaintext) as ServerNote)
+          : kind === 'notebook' ? contentBytes('notebook', JSON.parse(plaintext) as ServerNotebook)
+          : contentBytes('comment', plaintext);
+        update.run(bytes, row.id);
+      }
+    }
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+  db.exec('CREATE INDEX IF NOT EXISTS notes_owner ON notes(owner_id); CREATE INDEX IF NOT EXISTS notebooks_owner ON notebooks(owner_id)');
   // Earlier development snapshots stored entire response bodies. Migrate to
   // minimal receipts, retaining only their versions and request fingerprints.
   const operationColumns = db.prepare('PRAGMA table_info(operations)').all() as unknown as Array<{ name: string }>;

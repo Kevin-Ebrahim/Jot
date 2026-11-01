@@ -331,7 +331,18 @@ async function pull(workspace: string, result: SyncResult): Promise<void> {
     }
     const db = await getWorkspaceDb(workspace);
     const locals = kind === 'note' ? await db.getAll('notes') : await db.getAll('notebooks');
-    if (locals.some(item => item.serverVersion !== null && !seen.has(item.id))) {
+    const byId = new Map(locals.map(item => [item.id, item]));
+    const acknowledgements = kind === 'note' ? new Map((await db.getAll('imports'))
+      .filter(item => item.key.startsWith('ack-unavailable-note:')).map(item => [item.key, item.targetId])) : new Map<string, string>();
+    if (locals.some(item => {
+      if (item.serverVersion === null || seen.has(item.id)) return false;
+      if (kind === 'note' && item.role === 'viewer' && item.syncState === 'local') {
+        const copyId = acknowledgements.get(`ack-unavailable-note:${item.id}`);
+        const copy = copyId ? byId.get(copyId) : undefined;
+        if (copy && !copy.deletedAt && copy.role === 'owner') return false;
+      }
+      return true;
+    })) {
       addError(result, `Some previously synced ${kind === 'note' ? 'notes' : 'notebooks'} are no longer accessible on the server; local copies were kept.`);
     }
   }

@@ -18,6 +18,8 @@ import { useShortcutModifier } from './use-shortcut-modifier';
 type Props = {
   draft: NoteDraft;
   busy?: boolean;
+  focusTitle?: boolean;
+  onTitleFocused?: () => void;
   forceReadOnly?: boolean;
   recoveryAvailable?: boolean;
   recoveryUnavailable?: boolean;
@@ -61,7 +63,7 @@ function renderWikiLinks(body: string) {
   }).join('');
 }
 
-export function NoteEditor({ draft, busy = false, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText, allowedRemoteImages, onAllowRemoteImage }: Props) {
+export function NoteEditor({ draft, busy = false, focusTitle = false, onTitleFocused, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText, allowedRemoteImages, onAllowRemoteImage }: Props) {
   const note = draft.note;
   const modifier = useShortcutModifier();
   const viewer = forceReadOnly || note.role === 'viewer';
@@ -100,8 +102,12 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
     setConflictChoice(null);
     setScheduleOpen(false);
     setRecoverConfirm(false); setRecoverError('');
-    if (!note.title && !note.body && !viewer) requestAnimationFrame(() => titleRef.current?.focus());
   }, [note.id]);
+  useEffect(() => {
+    if (viewer || busy || (!focusTitle && (note.title || note.body))) return;
+    const frame = requestAnimationFrame(() => { titleRef.current?.focus(); if (focusTitle) onTitleFocused?.(); });
+    return () => cancelAnimationFrame(frame);
+  }, [note.id, focusTitle, viewer, busy]);
   useEffect(() => { if (draft.status !== 'conflict') setConflictChoice(null); }, [draft.status]);
   useEffect(() => { if (addingTag) tagRef.current?.focus(); }, [addingTag]);
   useEffect(() => {

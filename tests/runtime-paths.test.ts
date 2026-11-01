@@ -30,11 +30,14 @@ test("Whisper permits only read-only pinned model data and local runtime request
   const pinned = `https://huggingface.co/${WHISPER_MODEL}/resolve/${WHISPER_REVISION}/config.json`;
   assert.equal(approvedWhisperRequest(origin, main), pinned, "library main-branch metadata probes must be pinned");
   assert.equal(approvedWhisperRequest(origin, pinned), pinned);
+  assert.equal(approvedWhisperRequest(origin, `https://huggingface.co/${WHISPER_MODEL}/resolve/main/onnx/encoder_model_quantized.onnx`), `https://huggingface.co/${WHISPER_MODEL}/resolve/${WHISPER_REVISION}/onnx/encoder_model_quantized.onnx`);
   for (const bad of [
     "https://cdn.jsdelivr.net/evil.js",
     `${origin}/runtime/other.js`,
     `https://huggingface.co/${WHISPER_MODEL}/resolve/main/config.json?audio=secret`,
     `https://huggingface.co/${WHISPER_MODEL}/resolve/other/config.json`,
+    `https://huggingface.co/${WHISPER_MODEL}/resolve/main/unapproved.js`,
+    `https://huggingface.co/${WHISPER_MODEL}/resolve/main/unapproved.json`,
     `https://huggingface.co/${WHISPER_MODEL}/resolve/main/%2e%2e/other`,
     "https://user:pass@huggingface.co/Xenova/whisper-tiny.en/resolve/main/config.json",
   ]) assert.throws(() => approvedWhisperRequest(origin, bad), /Unapproved/);
@@ -52,4 +55,15 @@ test("Whisper permits only read-only pinned model data and local runtime request
   await whisperFetch(origin, fetcher)(local);
   assert.equal(calls[1].input, local); assert.equal(calls[1].init?.redirect, "error");
   assert.equal(calls[1].init?.credentials, "same-origin");
+});
+
+test("worker entrypoints explicitly apply the local runtime and restricted fetch policies", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const ocr = await readFile(new URL("../src/lib/features/ocr-worker.ts", import.meta.url), "utf8");
+  const speech = await readFile(new URL("../src/lib/features/transcription-worker.ts", import.meta.url), "utf8");
+  assert.match(ocr, /\.\.\.ocrRuntimePaths\(self\.location\.origin\)/);
+  assert.match(speech, /wasm\.wasmPaths\s*=\s*onnxRuntimePaths\(self\.location\.origin/);
+  assert.match(speech, /env\.fetch\s*=\s*whisperFetch\(self\.location\.origin\)/);
+  assert.match(speech, /revision:\s*WHISPER_REVISION/);
+  assert.doesNotMatch(ocr + speech, /https:\/\/cdn\.jsdelivr\.net/);
 });

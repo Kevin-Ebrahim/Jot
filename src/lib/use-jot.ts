@@ -69,6 +69,8 @@ export function useJot() {
     run(() => jotStore.createRecurringOccurrence(sourceId, expectedRevision, sourceBody, newInput, occurrenceKey)), [run]);
   const copyUnavailableNoteToInbox = useCallback((id: string, expectedRevision: number, draftPatch?: NotePatch) =>
     run(() => jotStore.copyUnavailableNoteToInbox(id, expectedRevision, draftPatch)), [run]);
+  const acknowledgeUnavailableNote = useCallback((id: string, expectedRevision: number, copyId: string) =>
+    run(() => jotStore.acknowledgeUnavailableNote(id, expectedRevision, copyId)), [run]);
   const createNotebook = useCallback((name: string) => run(() => jotStore.createNotebook(name)), [run]);
   const renameNotebook = useCallback((id: string, name: string) => run(() => jotStore.renameNotebook(id, name)), [run]);
   const deleteNotebook = useCallback((id: string) => run(() => jotStore.deleteNotebook(id)), [run]);
@@ -96,7 +98,7 @@ export function useJot() {
   return { notes, notebooks, isLoading, error, saveState, workspaceId, syncStatus, refresh, getCurrentWorkspaceId: getWorkspaceId,
     clearError: () => setError(null),
     listNotes: jotStore.listNotes, getNote: jotStore.getNote, listNotebooks: jotStore.listNotebooks,
-    createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox, createNotebook, renameNotebook, deleteNotebook,
+    createNote, updateNote, trashNote, restoreNote, createRecurringOccurrence, copyUnavailableNoteToInbox, acknowledgeUnavailableNote, createNotebook, renameNotebook, deleteNotebook,
     listAttachments: jotStore.listAttachments, addAttachment, deleteAttachment,
     exportBackup: jotStore.exportBackup, importBackup, exportMarkdownZip: jotStore.exportMarkdownZip,
     switchWorkspace, copyGuestNotesToAccount, syncNow, listConflicts, resolveConflict: resolve };

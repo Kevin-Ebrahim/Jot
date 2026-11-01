@@ -35,7 +35,7 @@ The server stores its SQLite database in `.jot-data` by default. Set `JOT_DATA_D
 - Account notes, notebooks, and attachments sync with this server. While the app is visible and online it polls approximately every 30 seconds; you can also sync manually. Changes made offline are retained locally and retried. Conflicts require a choice and preserve the local draft rather than silently overwriting it.
 - Account sync requires browser Web Locks support to prevent cross-tab races. If unavailable, sync is disabled; local editing and export remain available.
 - Share a note or notebook as viewer or editor. Notebook access applies to its notes; a separate note share can grant stronger access. Owners manage shares and trash/restore. Editors can change content and comment. This is versioned polling, **not** character-by-character CRDT co-editing.
-- Attachments are limited to 10 MiB each. Server storage and lifetime attachment-record quotas apply; see [server notes](src/server/README.md).
+- Attachments are limited to 10 MiB each. Server content, storage, and record quotas apply, including trashed notes; see [server notes](src/server/README.md).
 
 A production service worker can cache the app shell after a successful first load in a secure context (HTTPS or localhost). In a tested browser, after that cache was established, offline reload and editing worked and account sync resumed automatically after reconnecting. Availability still depends on the browser retaining the installed cache and local storage; features needing the network are unavailable offline.
 
@@ -49,9 +49,9 @@ For any non-local deployment, use HTTPS and a trusted reverse proxy. Set `JOT_AP
 
 ## Capture and organization
 
-Markdown notes support tags, links, checklists, search, templates, and local rediscovery. A web capture saves an HTTP(S) bookmark and optional pasted/imported content; it does not fetch the remote page. PDF capture extracts selectable text locally, not scanned pages. Image OCR is opt-in and English-only; on first use it downloads its engine and language files from public CDNs.
+Markdown notes support tags, links, checklists, search, templates, and local rediscovery. A web capture saves an HTTP(S) bookmark and optional pasted/imported content; it does not fetch the remote page. PDF capture extracts selectable text locally, not scanned pages. Image OCR is opt-in and English-only; on first use it loads pinned engine and language files from this app's origin, and the image is processed locally.
 
-Prerecorded audio transcription is opt-in, English-only, and limited to two minutes and 10 MiB. It is designed to run locally in the browser using `Xenova/whisper-tiny.en`; first use downloads about 45 MB of model files from Hugging Face plus runtime from a CDN. Audio is not sent to a transcription service, but normal account sync may send saved audio and transcripts to your server. Review results for mistakes; browser inference is still awaiting verification. Recording and live dictation depend on browser support, and a browser speech provider may receive dictated audio.
+Prerecorded audio transcription is opt-in, English-only, and limited to two minutes and 10 MiB. It is designed to run locally in the browser using `Xenova/whisper-tiny.en`; first use downloads about 45 MB of model files from Hugging Face plus runtime from this app's origin. Audio is not sent to a transcription service, but normal account sync may send saved audio and transcripts to your server. Review results for mistakes; browser inference is still awaiting verification. Recording and live dictation depend on browser support, and a browser speech provider may receive dictated audio.
 
 Reminders appear in the Tasks view; Jot does not send background alerts. Recurring notes are manual by default. An optional per-routine setting creates one due occurrence while Jot is open and foregrounded, then advances to the next future date; missed occurrences are not backfilled. There is no closed-app or server scheduler.
 

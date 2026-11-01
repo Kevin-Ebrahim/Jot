@@ -3,6 +3,11 @@ const TESSERACT_ROOT = "/runtime/tesseract-6.0.1";
 const ONNX_ROOT = "/runtime/onnx-1.31.0-dev.20260914-8d85527a0";
 export const WHISPER_MODEL = "Xenova/whisper-tiny.en";
 export const WHISPER_REVISION = "5ba193d28a5ee3cb91de94d6a04fa6f115fb9655";
+const WHISPER_DATA_FILES = new Set([
+  "config.json", "generation_config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json",
+  "special_tokens_map.json", "added_tokens.json", "merges.txt", "normalizer.json", "vocab.json",
+  "onnx/encoder_model_quantized.onnx", "onnx/decoder_model_merged_quantized.onnx",
+]);
 
 function appOrigin(origin: string): string {
   const base = new URL(origin);
@@ -59,7 +64,7 @@ export function approvedWhisperRequest(origin: string, input: string | URL, init
   const slash = remainder.indexOf("/");
   const revision = slash < 0 ? "" : remainder.slice(0, slash);
   const file = slash < 0 ? "" : remainder.slice(slash + 1);
-  if ((revision !== "main" && revision !== WHISPER_REVISION) || !file || !/^[A-Za-z0-9_.\/-]+$/.test(file) || file.split("/").some((part) => part === ".." || part === "." || !part)) {
+  if ((revision !== "main" && revision !== WHISPER_REVISION) || !WHISPER_DATA_FILES.has(file)) {
     throw new Error("Unapproved transcription model resource.");
   }
   return `https://huggingface.co${prefix}${WHISPER_REVISION}/${file}`;

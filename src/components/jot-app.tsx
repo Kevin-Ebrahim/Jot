@@ -20,6 +20,7 @@ import { useDialogFocus } from './use-dialog-focus';
 import { createWorkspaceLease } from './workspace-lease';
 import { createStableNoteMerger } from './note-derivations';
 import { useTaskCount } from './use-task-count';
+import { createNoteTransitionGuard } from './note-transition';
 
 type Jot = ReturnType<typeof useJot>;
 type Drafts = ReturnType<typeof useNoteDrafts>;
@@ -89,7 +90,12 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   const account = useCollaboration();
   const accountAttention = account.pendingSession ? 'Account change needs review' : account.sessionStatus === 'error' ? 'Account sync needs attention' : null;
   const [view, setView] = useState<View>({ kind: 'all' });
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedIdState] = useState<string | null>(null);
+  const noteGuard = useRef(createNoteTransitionGuard()).current;
+  const setSelectedId = useCallback((id: string | null) => { if (noteGuard.select(id)) setSelectedIdState(id); }, [noteGuard]);
+  const [noteCreating, setNoteCreating] = useState(false);
+  const [focusTitleId, setFocusTitleId] = useState<string | null>(null);
+  const [pendingCreated, setPendingCreated] = useState<Note[]>([]);
   activeNoteId.current = selectedId;
   const [mobileNoteOpen, setMobileNoteOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -138,12 +144,20 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   useEffect(() => {
     if (previousWorkspace.current === jot.workspaceId) return;
     previousWorkspace.current = jot.workspaceId;
-    setSelectedId(null); setView({ kind: 'all' }); setMobileNoteOpen(false); setSearchOpen(false); setCommentsOpen(false); setShareTarget(null); setAllowedRemoteImages(new Set());
+    setSelectedId(null); setPendingCreated([]); setFocusTitleId(null); setView({ kind: 'all' }); setMobileNoteOpen(false); setSearchOpen(false); setCommentsOpen(false); setShareTarget(null); setAllowedRemoteImages(new Set());
   }, [jot.workspaceId]);
 
   useEffect(() => { if (locked) setSearchOpen(false); }, [locked]);
 
-  const effectiveNotes = useMemo(() => mergeNotes(jot.notes, drafts.entries), [jot.notes, drafts.entries, mergeNotes]);
+  const sourceNotes = useMemo(() => {
+    const persisted = new Set(jot.notes.map((note) => note.id));
+    return [...pendingCreated.filter((note) => !persisted.has(note.id)), ...jot.notes];
+  }, [jot.notes, pendingCreated]);
+  useEffect(() => {
+    const persisted = new Set(jot.notes.map((note) => note.id));
+    setPendingCreated((items) => items.some((note) => persisted.has(note.id)) ? items.filter((note) => !persisted.has(note.id)) : items);
+  }, [jot.notes]);
+  const effectiveNotes = useMemo(() => mergeNotes(sourceNotes, drafts.entries), [sourceNotes, drafts.entries, mergeNotes]);
   const taskCount = useTaskCount(effectiveNotes, jot.workspaceId);
   const listView = view.kind === 'all' || view.kind === 'inbox' || view.kind === 'starred' || view.kind === 'notebook';
   const filteredNotes = useMemo(() => effectiveNotes.filter((note) => {
@@ -153,12 +167,12 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     return true;
   }), [effectiveNotes, view]);
   useEffect(() => {
-    if (!listView || jot.isLoading) return;
+    if (!listView || jot.isLoading || noteGuard.isActive()) return;
     if (!selectedId || !filteredNotes.some((note) => note.id === selectedId)) {
       const first = [...filteredNotes].sort((a, b) => Number(b.pinned) - Number(a.pinned) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
       setSelectedId(first?.id || null);
     }
-  }, [listView, jot.isLoading, filteredNotes, selectedId]);
+  }, [listView, jot.isLoading, filteredNotes, selectedId, noteCreating, noteGuard, setSelectedId]);
   useEffect(() => {
     if (view.kind !== 'trash') return;
     let active = true;
@@ -186,11 +200,23 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   const openNote = useCallback((id: string) => {
     setView({ kind: 'all' }); setSelectedId(id); setMobileNoteOpen(true); setSidebarOpen(false);
   }, []);
-  const createNote = useCallback(async (input: NewNote = {}) => runOperation(async () => {
-    const note = await jot.createNote(input);
-    await jot.refresh();
-    setView({ kind: 'all' }); setSelectedId(note.id); setMobileNoteOpen(true); setSidebarOpen(false);
-  }), [jot.createNote, jot.refresh, runOperation]);
+  const createAndSelect = useCallback(async (operation: () => Promise<Note>) => {
+    const token = noteGuard.begin();
+    if (token === null) throw new Error('A note is already being created.');
+    // This ref guard closes the old editor before the first asynchronous step.
+    setNoteCreating(true);
+    try {
+      const note = await runOperation(operation);
+      setPendingCreated((items) => [...items.filter((item) => item.id !== note.id), note]);
+      if (!noteGuard.complete(token, note.id)) throw new Error('The note was created, but selection changed. Find it in All notes.');
+      setSelectedIdState(note.id); setFocusTitleId(note.id); setView({ kind: 'all' }); setMobileNoteOpen(true); setSidebarOpen(false);
+      void jot.refresh();
+    } catch (error) {
+      setSelectedIdState(noteGuard.cancel(token));
+      throw error;
+    } finally { setNoteCreating(false); }
+  }, [jot.refresh, noteGuard, runOperation]);
+  const createNote = useCallback(async (input: NewNote = {}) => createAndSelect(() => jot.createNote(input)), [createAndSelect, jot.createNote]);
   const newNote = useCallback(() => {
     if (creating.current) return;
     creating.current = true;
@@ -202,7 +228,7 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   const closeNotebookDialog = useCallback(() => setNotebookDialog(null), []);
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (uiLocked.current) { if ((event.metaKey || event.ctrlKey) && ['k', 'n'].includes(event.key.toLowerCase())) event.preventDefault(); return; }
+      if (uiLocked.current || noteGuard.isActive()) { if ((event.metaKey || event.ctrlKey) && ['k', 'n'].includes(event.key.toLowerCase())) event.preventDefault(); return; }
       if (event.key === 'Escape') setSidebarOpen(false);
       if (captureOpen || notebookDialog || accountOpen || commentsOpen || shareTarget || searchOpen) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setSearchOpen(true); }
@@ -210,9 +236,9 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     };
     window.addEventListener('keydown', key);
     return () => window.removeEventListener('keydown', key);
-  }, [newNote, captureOpen, notebookDialog, accountOpen, commentsOpen, shareTarget, searchOpen]);
+  }, [newNote, captureOpen, notebookDialog, accountOpen, commentsOpen, shareTarget, searchOpen, noteGuard]);
 
-  const capture = async (input: NewNote, files: File[]) => runOperation(async () => {
+  const capture = async (input: NewNote, files: File[]) => createAndSelect(async () => {
     // Keep progress if an attachment fails, so retrying cannot create duplicate notes.
     if (!captureProgress.current) {
       const created = await jot.createNote(input);
@@ -234,12 +260,13 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
       const attachment = await jot.addAttachment(progress.noteId, file, file.name);
       progress.files.set(file, attachment.id);
     }
-    await jot.refresh();
-    setView({ kind: 'all' }); setSelectedId(progress.noteId); setMobileNoteOpen(true);
+    const note = await jot.getNote(progress.noteId);
+    if (!note) throw new Error('The captured note is no longer available.');
     captureProgress.current = null;
+    return note;
   });
   const trashSelected = async () => {
-    if (!selected || editorActionLock.current) return;
+    if (!selected || !noteGuard.accepts(selected.id) || editorActionLock.current) return;
     editorActionLock.current = true; setEditorBusy(true);
     try {
       await runOperation(async () => {
@@ -253,14 +280,14 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
   };
   const toggleTask = (noteId: string, lineIndex: number) => {
     const note = effectiveNotes.find((item) => item.id === noteId);
-    if (!note || note.role === 'viewer' || uiLocked.current) return;
+    if (!note || note.role === 'viewer' || uiLocked.current || noteGuard.isActive()) return;
     const current = drafts.get(note).note;
     const body = toggleTaskInBody(current.body, lineIndex);
     if (body !== current.body) drafts.change(current, { body });
   };
   const reviewed = (noteId: string) => {
     const note = effectiveNotes.find((item) => item.id === noteId);
-    if (!note || note.role === 'viewer' || uiLocked.current) return;
+    if (!note || note.role === 'viewer' || uiLocked.current || noteGuard.isActive()) return;
     const next = new Date(); next.setDate(next.getDate() + 7);
     const date = [next.getFullYear(), String(next.getMonth() + 1).padStart(2, '0'), String(next.getDate()).padStart(2, '0')].join('-');
     const current = drafts.get(note).note;
@@ -274,16 +301,14 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     const saved = await drafts.save(current.id);
     if (!saved) throw new Error('The routine change is still in your draft. Resolve its save issue before continuing.');
   });
-  const createRecurring = async (source: Note) => runOperation(async () => {
+  const createRecurring = async (source: Note) => createAndSelect(async () => {
     const saved = drafts.entries[source.id] ? await drafts.save(source.id) : source;
     if (!saved) throw new Error('Resolve the source note’s unsaved changes first.');
     const occurrence = prepareNextRecurringNote(saved);
     if (!occurrence) throw new Error('This note no longer has a valid recurring schedule.');
-    const created = await jot.createRecurringOccurrence(saved.id, saved.revision, occurrence.nextSourceBody, occurrence.newInput, occurrence.occurrenceKey);
-    await jot.refresh();
-    setView({ kind: 'all' }); setSelectedId(created.id); setMobileNoteOpen(true);
+    return jot.createRecurringOccurrence(saved.id, saved.revision, occurrence.nextSourceBody, occurrence.newInput, occurrence.occurrenceKey);
   });
-  const copyUnavailable = async () => runOperation(async () => {
+  const copyUnavailable = async () => createAndSelect(async () => {
     if (!persistedSelected || !recoveryAvailable) throw new Error('This note no longer needs recovery.');
     const id = persistedSelected.id;
     try {
@@ -296,16 +321,23 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
       const accepted = drafts.finishRecovery(source, reviewed.sequence);
       await jot.refresh();
       if (!accepted) throw new Error('A copy was created, but newer edits remain in this draft. Review them and make another copy if needed.');
+      try { await jot.acknowledgeUnavailableNote(source.id, source.revision, copy.id); }
+      catch { setNotice('Your personal copy was saved, but the access warning could not be cleared.'); }
       jot.clearError();
-      setView({ kind: 'all' }); setSelectedId(copy.id); setMobileNoteOpen(true);
+      return copy;
     } finally { drafts.cancelRecovery(id); }
   });
   const closeCapture = () => {
-    if (captureProgress.current) {
-      setView({ kind: 'all' }); setSelectedId(captureProgress.current.noteId); setMobileNoteOpen(true);
-      setNotice('The note was created, but capture did not finish. Check its attachments before retrying.');
-    }
+    const partialId = captureProgress.current?.noteId;
     setCaptureOpen(false); captureProgress.current = null;
+    if (partialId) {
+      setNotice('The note was created, but capture did not finish. Check its attachments before retrying.');
+      void createAndSelect(async () => {
+        const note = await jot.getNote(partialId);
+        if (!note) throw new Error('The partial capture is no longer available.');
+        return note;
+      }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not open the partial capture.'));
+    }
   };
   const handleNotebook = async (value: string) => runOperation(async () => {
     if (!notebookDialog) return;
@@ -319,12 +351,12 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     await jot.refresh();
   });
 
-  return <><div className={`jot-app ${mobileNoteOpen ? 'has-mobile-note' : ''}`} inert={locked ? true : undefined} aria-busy={locked}>
+  return <><div className={`jot-app ${mobileNoteOpen ? 'has-mobile-note' : ''}`} inert={locked || noteCreating ? true : undefined} aria-busy={locked || noteCreating}>
     <Sidebar view={view} notebooks={jot.notebooks} counts={counts} online={online} accountAttention={accountAttention} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(next) => { setView(next); setMobileNoteOpen(false); }} onNew={newNote} onCapture={() => { captureProgress.current = null; captureReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setCaptureOpen(true); setSidebarOpen(false); }} onSearch={() => { setSearchOpen(true); setSidebarOpen(false); }} onCreateNotebook={() => setNotebookDialog({ mode: 'create' })} onRenameNotebook={(notebook) => setNotebookDialog({ mode: 'rename', notebook })} onShareNotebook={(notebook) => setShareTarget({ noteId: null, notebookId: notebook.id })} onDeleteNotebook={(notebook) => setNotebookDialog({ mode: 'delete', notebook })} onAccount={() => setAccountOpen(true)} />
     {listView ? <>
       <NoteList title={listTitle} viewKey={`${view.kind}:${view.id || ''}`} notes={filteredNotes} notebooks={jot.notebooks} selectedId={selectedId} onSelect={selectNote} onNew={newNote} onSearch={() => setSearchOpen(true)} onOpenSidebar={() => setSidebarOpen(true)} />
-      {selectedDraft ? <NoteEditor draft={selectedDraft} busy={editorBusy} forceReadOnly={persistedSelected?.role === 'viewer'} recoveryAvailable={recoveryAvailable} recoveryUnavailable={persistedSelected?.syncState === 'local'} onCopyUnavailable={copyUnavailable} notes={effectiveNotes} notebooks={jot.notebooks} onChange={(patch) => { if (!editorActionLock.current && !uiLocked.current && persistedSelected?.role !== 'viewer') drafts.change(selectedDraft.note, patch); }} onOpenNote={openNote} onBack={() => setMobileNoteOpen(false)} onOpenSidebar={() => setSidebarOpen(true)} onTrash={() => { void trashSelected(); }} onShare={() => { void runOperation(async () => { const saved = drafts.entries[selectedDraft.note.id] ? await drafts.save(selectedDraft.note.id) : selectedDraft.note; if (!saved) throw new Error('Resolve the unsaved changes before sharing this note.'); setShareTarget({ noteId: saved.id, notebookId: saved.notebookId }); }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not prepare this note for sharing.')); }} onComments={() => setCommentsOpen(true)} onKeepMine={() => { if (!uiLocked.current) void drafts.keepMine(selectedDraft.note.id); }} onUseLatest={() => { if (!uiLocked.current) drafts.useLatest(selectedDraft.note.id); }} onRetry={() => { if (!uiLocked.current) void drafts.retry(selectedDraft.note.id); }} listAttachments={jot.listAttachments} addAttachment={(noteId, file, name) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.addAttachment(noteId, file, name); })} deleteAttachment={(id) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.deleteAttachment(id); })} allowedRemoteImages={allowedRemoteImages} onAllowRemoteImage={(key) => setAllowedRemoteImages((current) => new Set(current).add(key))} onAppendText={async (text) => runOperation(async () => {
-        if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed before extraction finished. Please try again.');
+      {selectedDraft ? <NoteEditor key={selectedDraft.note.id} draft={selectedDraft} busy={editorBusy || noteCreating} focusTitle={focusTitleId === selectedDraft.note.id} onTitleFocused={() => setFocusTitleId(null)} forceReadOnly={persistedSelected?.role === 'viewer'} recoveryAvailable={recoveryAvailable} recoveryUnavailable={persistedSelected?.syncState === 'local'} onCopyUnavailable={copyUnavailable} notes={effectiveNotes} notebooks={jot.notebooks} onChange={(patch) => { if (!editorActionLock.current && !uiLocked.current && noteGuard.accepts(selectedDraft.note.id) && persistedSelected?.role !== 'viewer') drafts.change(selectedDraft.note, patch); }} onOpenNote={openNote} onBack={() => setMobileNoteOpen(false)} onOpenSidebar={() => setSidebarOpen(true)} onTrash={() => { void trashSelected(); }} onShare={() => { if (!noteGuard.accepts(selectedDraft.note.id)) return; void runOperation(async () => { const saved = drafts.entries[selectedDraft.note.id] ? await drafts.save(selectedDraft.note.id) : selectedDraft.note; if (!saved) throw new Error('Resolve the unsaved changes before sharing this note.'); if (noteGuard.accepts(saved.id)) setShareTarget({ noteId: saved.id, notebookId: saved.notebookId }); }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not prepare this note for sharing.')); }} onComments={() => { if (noteGuard.accepts(selectedDraft.note.id)) setCommentsOpen(true); }} onKeepMine={() => { if (!uiLocked.current && noteGuard.accepts(selectedDraft.note.id)) void drafts.keepMine(selectedDraft.note.id); }} onUseLatest={() => { if (!uiLocked.current && noteGuard.accepts(selectedDraft.note.id)) drafts.useLatest(selectedDraft.note.id); }} onRetry={() => { if (!uiLocked.current && noteGuard.accepts(selectedDraft.note.id)) void drafts.retry(selectedDraft.note.id); }} listAttachments={jot.listAttachments} addAttachment={(noteId, file, name) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender || !noteGuard.accepts(selectedDraft.note.id)) throw new Error('The note or workspace changed. Please reopen the note.'); return jot.addAttachment(noteId, file, name); })} deleteAttachment={(id) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender || !noteGuard.accepts(selectedDraft.note.id)) throw new Error('The note or workspace changed. Please reopen the note.'); return jot.deleteAttachment(id); })} allowedRemoteImages={allowedRemoteImages} onAllowRemoteImage={(key) => setAllowedRemoteImages((current) => new Set(current).add(key))} onAppendText={async (text) => runOperation(async () => {
+        if (workspaceGeneration.current !== generationAtRender || !noteGuard.accepts(selectedDraft.note.id)) throw new Error('The note or workspace changed before extraction finished. Please try again.');
         const current = drafts.get(selectedDraft.note).note;
         if (current.body.length + text.length > 1_000_000) throw new Error('This note would exceed the 1,000,000-character limit. Keep the attachment or shorten the note before extracting text.');
         drafts.change(current, { body: current.body + text });
@@ -340,7 +372,7 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, activeNoteId
     <AccountDialog open={accountOpen} onClose={() => setAccountOpen(false)} />
     <ShareDialog open={!!shareTarget} onClose={() => setShareTarget(null)} note={effectiveNotes.find((note) => note.id === shareTarget?.noteId) || null} notebook={jot.notebooks.find((notebook) => notebook.id === shareTarget?.notebookId) || null} />
     <CommentsPanel open={commentsOpen} onClose={() => setCommentsOpen(false)} note={selectedDraft?.note || null} />
-  </div>{locked && <div className="workspace-transition" role="status" aria-live="polite"><span className="transition-spinner" />{transferring ? 'Preparing your backup…' : 'Opening workspace…'}</div>}</>;
+  </div>{(locked || noteCreating) && <div className="workspace-transition" role="status" aria-live="polite"><span className="transition-spinner" />{noteCreating ? 'Creating note…' : transferring ? 'Preparing your backup…' : 'Opening workspace…'}</div>}</>;
 }
 
 function CaptureOverlay({ children, returnFocus }: { children: React.ReactNode; returnFocus: HTMLElement | null }) {
