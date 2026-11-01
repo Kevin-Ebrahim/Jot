@@ -6,8 +6,8 @@ import { CollaborationApiError, messageForError, request, type CollaborationSess
 
 export interface CollaborationWorkspace {
   workspaceId: string | null;
-  /** Flush or reject unsaved drafts before changing the server session. */
-  prepareWorkspaceSwitch: () => Promise<void>;
+  /** Atomically block workspace edits/transfers and flush drafts; release after the transition. */
+  beginWorkspaceTransition: () => Promise<() => void>;
   switchWorkspace: (userId: string | null) => Promise<void>;
   copyGuestNotesToAccount: (userId: string) => Promise<number>;
   syncNow: () => Promise<SyncResult>;
@@ -69,13 +69,20 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   const operation = useRef(0);
   const mounted = useRef(true);
   const switchQueue = useRef<Promise<void>>(Promise.resolve());
-  const syncInFlight = useRef<Promise<SyncResult> | null>(null);
+  const syncInFlight = useRef<{ workspaceId: string; promise: Promise<SyncResult> } | null>(null);
   const resolutionInFlight = useRef<Promise<void> | null>(null);
   const importInFlight = useRef<Promise<number> | null>(null);
+  const activeRelease = useRef<(() => void) | null>(null);
+  const activeAuthRequest = useRef<AbortController | null>(null);
 
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; operation.current += 1; };
+    return () => {
+      mounted.current = false; operation.current += 1;
+      activeAuthRequest.current?.abort();
+      activeRelease.current?.();
+      activeRelease.current = null;
+    };
   }, []);
 
   const applySession = useCallback(async (next: CollaborationSession, currentOperation: number) => {
@@ -87,7 +94,6 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     // Serialize switches so an older, slow IndexedDB open cannot win a race with
     // a newer sign-in or sign-out. Never switch based on an unsuccessful fetch.
     const transition = switchQueue.current.catch(() => undefined).then(async () => {
-      if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
       if (resolutionInFlight.current) await resolutionInFlight.current.catch(() => undefined);
       if (importInFlight.current) await importInFlight.current.catch(() => undefined);
       if (currentOperation !== operation.current || !mounted.current) return;
@@ -113,53 +119,93 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     }
   }, []);
 
+  // A bounded request keeps a stalled network from locking the local editor
+  // indefinitely. An aborted mutation is treated as an uncertain outcome.
+  const authRequest = useCallback(async <T,>(path: string, options: Omit<RequestOptions, 'signal'> & { csrfToken?: string | null; workspaceId?: string } = {}): Promise<T> => {
+    const controller = new AbortController();
+    activeAuthRequest.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
+    try { return await request<T>(path, { ...options, signal: controller.signal }); }
+    finally {
+      window.clearTimeout(timeout);
+      if (activeAuthRequest.current === controller) activeAuthRequest.current = null;
+    }
+  }, []);
+
   const refreshSession = useCallback(async () => {
     const currentOperation = ++operation.current;
     setSessionStatus('checking');
     setSessionError(null);
+    let release: (() => void) | undefined;
+    let requestStarted = false;
     try {
-      const next = validSession(await request<CollaborationSession>('/api/auth/session'));
+      // The shell acquires this lease synchronously before awaiting draft flush.
+      // It also excludes backup transfers and prevents new edits until release.
+      release = await workspaceRef.current.beginWorkspaceTransition();
+      if (currentOperation !== operation.current || !mounted.current) return;
+      activeRelease.current = release;
+      requestStarted = true;
+      const next = validSession(await authRequest<CollaborationSession>('/api/auth/session'));
       if (currentOperation !== operation.current || !mounted.current) return;
       await applySession(next, currentOperation);
     } catch (error) {
       if (currentOperation === operation.current && mounted.current) {
         setSessionStatus('error');
-        setSessionError(error instanceof Error && error.message.startsWith('Could not open the confirmed workspace.')
-          ? error.message
-          : 'Could not check your session. Your local workspace has not been changed. Check your connection and retry.');
+        const message = error instanceof Error ? error.message : 'Local workspace preparation failed.';
+        setSessionError(!requestStarted ? `${message} Your local workspace has not been changed.`
+          : message.startsWith('Could not open the confirmed workspace.') ? message
+            : 'Could not check your session. Your local workspace has not been changed. Check your connection and retry.');
       }
       throw error;
+    } finally {
+      release?.();
+      if (activeRelease.current === release) activeRelease.current = null;
     }
-  }, [applySession]);
+  }, [applySession, authRequest]);
 
-  useEffect(() => { void refreshSession().catch(() => undefined); }, [refreshSession]);
+  useEffect(() => {
+    // React Strict Mode can mount, clean up, and remount effects synchronously.
+    // Deferring the check lets that probe finish before acquiring the shell lease.
+    const timer = window.setTimeout(() => { void refreshSession().catch(() => undefined); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [refreshSession]);
 
   const authenticate = useCallback(async (mode: 'login' | 'register', email: string, password: string) => {
     const currentOperation = ++operation.current;
+    setSessionStatus('checking');
+    setSessionError(null);
+    let release: (() => void) | undefined;
     let requestStarted = false;
     let responseConfirmed = false;
     try {
-      // Do not change server identity while there is an unflushed local draft.
-      await workspaceRef.current.prepareWorkspaceSwitch();
+      release = await workspaceRef.current.beginWorkspaceTransition();
+      if (currentOperation !== operation.current || !mounted.current) return;
+      activeRelease.current = release;
       requestStarted = true;
-      const next = validSession(await request<CollaborationSession>(`/api/auth/${mode}`, {
+      const next = validSession(await authRequest<CollaborationSession>(`/api/auth/${mode}`, {
         method: 'POST', body: { email, password },
       }));
       responseConfirmed = true;
       if (currentOperation !== operation.current || !mounted.current) return;
-      setSessionStatus('checking');
       await applySession(next, currentOperation);
     } catch (error) {
-      // A network failure can occur after the server has changed the cookie.
-      // Do not assume the account is still guest or retry a registration blindly.
-      if (requestStarted && !responseConfirmed && !(error instanceof CollaborationApiError && error.status >= 400 && error.status < 500)
-          && currentOperation === operation.current && mounted.current) {
-        setSessionStatus('error');
-        setSessionError('Could not confirm the account request. Your local workspace has not been changed. Check the session before trying again.');
+      if (currentOperation === operation.current && mounted.current && !responseConfirmed) {
+        // An explicit 4xx has a known result. Network errors and 5xx responses
+        // may arrive after a cookie change, so require a fresh session check.
+        if (!requestStarted || (error instanceof CollaborationApiError && error.status >= 400 && error.status < 500)) {
+          setSessionStatus('ready');
+          setSessionError(null);
+        } else {
+          setSessionStatus('error');
+          setSessionError('Could not confirm the account request. Your local workspace has not been changed. Check the session before trying again.');
+        }
       }
       throw error;
+    } finally {
+      release?.();
+      if (activeRelease.current === release) activeRelease.current = null;
     }
-  }, [applySession]);
+  }, [applySession, authRequest]);
 
   const signIn = useCallback((email: string, password: string) => authenticate('login', email, password), [authenticate]);
   const register = useCallback((email: string, password: string) => authenticate('register', email, password), [authenticate]);
@@ -169,15 +215,18 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     const currentOperation = ++operation.current;
     setSessionStatus('checking');
     setSessionError(null);
+    let release: (() => void) | undefined;
     let requestStarted = false;
     let serverSignedOut = false;
     try {
-      if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
+      release = await workspaceRef.current.beginWorkspaceTransition();
+      if (currentOperation !== operation.current || !mounted.current) return;
+      activeRelease.current = release;
       if (resolutionInFlight.current) await resolutionInFlight.current.catch(() => undefined);
       if (importInFlight.current) await importInFlight.current.catch(() => undefined);
-      await workspaceRef.current.prepareWorkspaceSwitch();
+      if (currentOperation !== operation.current || !mounted.current) return;
       requestStarted = true;
-      await request<{ ok: true }>('/api/auth/logout', { method: 'POST', csrfToken: session.csrfToken });
+      await authRequest<{ ok: true }>('/api/auth/logout', { method: 'POST', csrfToken: session.csrfToken, workspaceId: session.user.id });
       serverSignedOut = true;
       await applySession({ user: null, csrfToken: null }, currentOperation);
     } catch (error) {
@@ -194,8 +243,11 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
         }
       }
       throw error;
+    } finally {
+      release?.();
+      if (activeRelease.current === release) activeRelease.current = null;
     }
-  }, [applySession, session]);
+  }, [applySession, authRequest, session]);
 
   const workspaceReady = sessionStatus === 'ready' && workspacePhase === 'ready'
     && session !== null && workspace.workspaceId === (session.user?.id ?? null);
@@ -204,12 +256,15 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before syncing.');
     if (resolutionInFlight.current) throw new Error('Wait for the conflict resolution to finish before syncing.');
     if (importInFlight.current) throw new Error('Wait for guest notes to finish copying before syncing.');
-    if (syncInFlight.current) return syncInFlight.current;
+    const userId = session.user.id;
+    const currentOperation = operation.current;
+    if (syncInFlight.current?.workspaceId === userId) return syncInFlight.current.promise;
     const pending = workspaceRef.current.syncNow();
-    syncInFlight.current = pending;
+    const entry = { workspaceId: userId, promise: pending };
+    syncInFlight.current = entry;
     try {
       const result = await pending;
-      if (mounted.current) {
+      if (mounted.current && currentOperation === operation.current && workspaceRef.current.workspaceId === userId) {
         setLastSync(result);
         if (result.errors.length) setSyncMessage(result.errors.join(' '));
         else if (result.conflicts) setSyncMessage(`${result.conflicts} ${result.conflicts === 1 ? 'conflict needs' : 'conflicts need'} your attention. Your local changes were kept.`);
@@ -217,10 +272,10 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
       }
       return result;
     } catch (error) {
-      if (mounted.current) setSyncMessage(messageForError(error));
+      if (mounted.current && currentOperation === operation.current && workspaceRef.current.workspaceId === userId) setSyncMessage(messageForError(error));
       throw error;
     } finally {
-      if (syncInFlight.current === pending) syncInFlight.current = null;
+      if (syncInFlight.current === entry) syncInFlight.current = null;
     }
   }, [session, workspaceReady]);
 
@@ -253,7 +308,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     const pending = (async () => {
       // Do not let a sync started before the copy make the new records look
       // synchronized. Wait for it, then copy atomically, then start a fresh sync.
-      if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
+      if (syncInFlight.current?.workspaceId === userId) await syncInFlight.current.promise.catch(() => undefined);
       if (currentOperation !== operation.current) throw new Error('The account changed before copying began.');
       return workspaceRef.current.copyGuestNotesToAccount(userId);
     })();
@@ -277,7 +332,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before resolving conflicts.');
     if (resolutionInFlight.current) throw new Error('A conflict is already being resolved.');
     const pending = (async () => {
-      if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
+      if (syncInFlight.current?.workspaceId === session.user!.id) await syncInFlight.current.promise.catch(() => undefined);
       await workspaceRef.current.resolveConflict(id, choice, expectedRevision, expectedServerVersion);
       const remaining = await workspaceRef.current.listConflicts();
       if (mounted.current) {
@@ -293,9 +348,9 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
   const authenticatedRequest = useCallback(async <T,>(path: string, options: RequestOptions = {}): Promise<T> => {
     if (!session?.user || !session.csrfToken || !workspaceReady) throw new Error('Check your account session before continuing.');
     try {
-      return await request<T>(path, { ...options, csrfToken: session.csrfToken });
+      return await request<T>(path, { ...options, csrfToken: session.csrfToken, workspaceId: session.user.id });
     } catch (error) {
-      if (error instanceof CollaborationApiError && (error.status === 401 || (error.status === 403 && /csrf/i.test(error.message)))) {
+      if (error instanceof CollaborationApiError && (error.status === 401 || (error.status === 403 && /csrf/i.test(error.message)) || (error.status === 409 && /account changed|workspace/i.test(error.message)))) {
         setSessionStatus('error');
         setSessionError('Your session needs to be checked again. Your local workspace has not been changed.');
       }

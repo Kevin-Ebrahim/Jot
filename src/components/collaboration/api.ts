@@ -37,11 +37,12 @@ export class CollaborationApiError extends Error {
 
 export async function request<T>(
   path: string,
-  options: { method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown; csrfToken?: string | null; signal?: AbortSignal } = {},
+  options: { method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown; csrfToken?: string | null; workspaceId?: string; signal?: AbortSignal } = {},
 ): Promise<T> {
   const method = options.method || 'GET';
   const headers = new Headers({ Accept: 'application/json' });
   if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+  if (options.workspaceId) headers.set('X-Jot-Workspace', options.workspaceId);
   if (options.csrfToken && method !== 'GET') headers.set('X-CSRF-Token', options.csrfToken);
   const response = await fetch(path, {
     method,
