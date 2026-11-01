@@ -2,6 +2,8 @@
 
 Jot's server uses Node 24 and SQLite. `JOT_DATA_DIR` selects its data directory (default `.jot-data` in the working directory). Stop the server before copying the whole directory for a backup, or use a SQLite-aware backup method. Keep backups private. No external account, SMTP provider, or hosted service is required.
 
+Backend unit/integration tests run with `npm test`. For a production HTTP smoke test against a disposable database and synthetic accounts, run `npm run build && node tests/backend-live.mjs`.
+
 The first local account can register by default. To onboard additional users, an operator must explicitly set `JOT_ALLOW_REGISTRATION=true`; set it to `false` to disable all registration. There is no default password. Passwords require at least 12 characters. Sharing grants access to an **existing** account; it does not send an email invitation.
 
 Use HTTPS and a properly configured reverse proxy for non-local access. Set `JOT_APP_ORIGIN` to the canonical public origin (for example, `https://notes.example`) and `JOT_SECURE_COOKIES=true` behind TLS termination. The process uses bounded per-account login/registration throttles and a concurrent password-hashing limit, but these are process-local, not a distributed abuse defense. For a proxy-sanitized client IP, set `JOT_TRUST_PROXY_IP_HEADER` to a header that **your trusted proxy overwrites with exactly one IP address**; otherwise forwarded headers are ignored. Add proxy-level rate limits for public deployments.
