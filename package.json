@@ -14,6 +14,7 @@
     "test:offline": "bash scripts/test-offline.sh"
   },
   "dependencies": {
+    "@huggingface/transformers": "4.3.2",
     "geist": "^1.5.1",
     "idb": "^8.0.3",
     "jszip": "^3.10.1",
