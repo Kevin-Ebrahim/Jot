@@ -2,7 +2,7 @@
 
 Jot's server uses Node 24 and SQLite. `JOT_DATA_DIR` selects its data directory (default `.jot-data` in the working directory). Stop the server before copying the whole directory for a backup, or use a SQLite-aware backup method. Keep backups private. No external account, SMTP provider, or hosted service is required.
 
-Backend unit/integration tests run with `npm test`. For a production HTTP smoke test against a disposable database and synthetic accounts, run `npm run build && node tests/backend-live.mjs`.
+Backend unit/integration tests run with `npm test`. For production HTTP and real client-adapter smoke tests against disposable databases and synthetic accounts, run `npm run build && node tests/backend-live.mjs && node --import tsx tests/backend-client-live.mts`. The latter uses fake IndexedDB, not a browser.
 
 The first local account can register by default. To onboard additional users, an operator must explicitly set `JOT_ALLOW_REGISTRATION=true`; set it to `false` to disable all registration. There is no default password. Passwords require at least 12 characters. Sharing grants access to an **existing** account; it does not send an email invitation.
 
