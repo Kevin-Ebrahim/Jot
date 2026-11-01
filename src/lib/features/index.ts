@@ -3,3 +3,5 @@ export * from "./links";
 export * from "./tasks";
 export * from "./templates";
 export * from "./resurface";
+export * from "./imported-text";
+export * from "./recurring";

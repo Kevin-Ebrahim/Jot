@@ -43,26 +43,34 @@ export async function extractPdfText(file: File, onProgress?: ExtractionProgress
  */
 export async function extractImageText(file: File, onProgress?: ExtractionProgress, signal?: AbortSignal): Promise<string> {
   if (signal?.aborted) throw new DOMException("Canceled", "AbortError");
-  const { createWorker } = await import("tesseract.js");
   onProgress?.("Loading English recognition data…");
-  const worker = await createWorker("eng", 1, {
-    logger: (progress) => {
-      if (!signal?.aborted && progress.status) {
-        const percentage = typeof progress.progress === "number" ? ` ${Math.round(progress.progress * 100)}%` : "";
-        onProgress?.(`${progress.status}${percentage}`);
-      }
-    },
+  const worker = new Worker(new URL("./ocr-worker.ts", import.meta.url), { type: "module" });
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const finish = (value?: string, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", cancel);
+      worker.terminate();
+      if (error) reject(error); else resolve(value || "");
+    };
+    const cancel = () => finish(undefined, new DOMException("Canceled", "AbortError"));
+    const timeout = window.setTimeout(() => finish(undefined, new Error("Text recognition timed out. Check your connection and retry.")), 120_000);
+    worker.onmessage = ({ data }: MessageEvent<{ type: "progress" | "done" | "error"; message?: string; text?: string }>) => {
+      if (data.type === "progress") onProgress?.(data.message || "Recognizing text…");
+      else if (data.type === "done") finish(data.text || "");
+      else if (data.type === "error") finish(undefined, new Error(data.message || "Text recognition failed."));
+    };
+    worker.onerror = (event) => finish(undefined, new Error(event.message || "Couldn’t start text recognition."));
+    worker.onmessageerror = () => finish(undefined, new Error("Couldn’t read the text recognition result."));
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
+    else {
+      try { worker.postMessage({ file }); }
+      catch (cause) { finish(undefined, cause instanceof Error ? cause : new Error("Couldn’t start text recognition.")); }
+    }
   });
-  const cancel = () => { void worker.terminate(); };
-  signal?.addEventListener("abort", cancel, { once: true });
-  try {
-    if (signal?.aborted) throw new DOMException("Canceled", "AbortError");
-    const result = await worker.recognize(file);
-    return result.data.text.trim();
-  } finally {
-    signal?.removeEventListener("abort", cancel);
-    await worker.terminate();
-  }
 }
 
 /**

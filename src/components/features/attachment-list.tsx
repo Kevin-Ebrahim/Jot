@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Download, FileAudio, FileImage, FileText, Plus, Trash2 } from "lucide-react";
 import type { Attachment } from "@/lib/types";
+import { subscribeStore } from "@/lib/store";
 import { extractImageText, extractPdfText } from "@/lib/features/extraction";
+import { escapeImportedText } from "@/lib/features/imported-text";
 import styles from "./attachment-list.module.css";
 
 export interface AttachmentListProps {
@@ -45,16 +47,16 @@ function AttachmentCard({ attachment, onDelete, onAppendText }: { attachment: At
     setWorking(true); setStatus(isImage(attachment) ? "Loading English recognition data…" : "Reading PDF…");
     try {
       const file = new File([attachment.blob], attachment.name, { type: attachment.mimeType });
-      const progress = (message: string) => { if (mounted.current) setStatus(message); };
+      const progress = (message: string) => { if (mounted.current && controller.current === abort && !abort.signal.aborted) setStatus(message); };
       const text = isImage(attachment) ? await extractImageText(file, progress, abort.signal) : await extractPdfText(file, progress, abort.signal);
-      if (abort.signal.aborted) return;
+      if (abort.signal.aborted || controller.current !== abort) return;
       if (!text) { setStatus(isPdf(attachment) ? "No selectable text found. Scanned PDF pages aren’t recognized yet." : "No text recognized."); return; }
       const name = attachment.name.replace(/[\r\n#\[\]\\]+/g, " ").trim();
-      await onAppendText(`\n\n### Extracted from ${name}\n\n${text}`);
-      if (mounted.current) setStatus("Text added to this note for search.");
+      await onAppendText(`\n\n### Extracted from ${escapeImportedText(name)}\n\n${escapeImportedText(text)}`);
+      if (mounted.current && controller.current === abort) setStatus("Text added to this note for search.");
     } catch (cause) {
-      if (mounted.current && !abort.signal.aborted) setStatus(cause instanceof Error ? `Couldn’t extract text: ${cause.message}` : "Couldn’t extract text.");
-    } finally { if (mounted.current) setWorking(false); if (controller.current === abort) controller.current = null; }
+      if (mounted.current && controller.current === abort && !abort.signal.aborted) setStatus(cause instanceof Error ? `Couldn’t extract text: ${cause.message}` : "Couldn’t extract text.");
+    } finally { if (controller.current === abort) { controller.current = null; if (mounted.current) setWorking(false); } }
   };
   const remove = async () => {
     if (!onDelete) return;
@@ -72,7 +74,7 @@ function AttachmentCard({ attachment, onDelete, onAppendText }: { attachment: At
       <div className={styles.tools}>
         {url && <a className={styles.action} href={url} download={attachment.name}><Download size={12} /> Download</a>}
         {onAppendText && (isImage(attachment) || isPdf(attachment)) && (working
-          ? <button type="button" className={styles.action} onClick={() => { controller.current?.abort(); setWorking(false); setStatus("Text extraction stopped."); }}>Stop</button>
+          ? <button type="button" className={styles.action} onClick={() => { const previous = controller.current; controller.current = null; previous?.abort(); setWorking(false); setStatus("Text extraction stopped."); }}>Stop</button>
           : <button type="button" className={styles.action} onClick={() => void extract()}>Make searchable</button>)}
         {onDelete && (confirmRemove ? <><button type="button" className={`${styles.action} ${styles.confirm}`} onClick={() => void remove()}>Confirm remove</button><button type="button" className={styles.action} onClick={() => setConfirmRemove(false)}>Cancel</button></> : <button type="button" className={styles.action} onClick={() => setConfirmRemove(true)}><Trash2 size={12} /> Remove</button>)}
       </div>
@@ -94,10 +96,17 @@ export function AttachmentList({ noteId, listAttachments, addAttachment, deleteA
     const request = ++generation.current;
     try {
       const result = await listAttachments(noteId);
-      if (request === generation.current && currentNote.current === noteId) { setItems(result.filter((item) => !item.deletedAt)); setError(""); }
+      if (request === generation.current && currentNote.current === noteId) {
+        setItems((previous) => result.filter((item) => !item.deletedAt).map((item) => {
+          const existing = previous.find((candidate) => candidate.id === item.id && candidate.size === item.size && candidate.mimeType === item.mimeType);
+          return existing ? { ...item, blob: existing.blob } : item;
+        }));
+        setError("");
+      }
     } catch (cause) { if (request === generation.current && currentNote.current === noteId) setError(cause instanceof Error ? cause.message : "Couldn’t load attachments."); }
   }, [listAttachments, noteId]);
   useEffect(() => { setItems([]); setBusy(false); void reload(); return () => { generation.current += 1; }; }, [reload, refreshKey]);
+  useEffect(() => subscribeStore(() => { void reload(); }), [reload]);
   const add = async (files: File[]) => {
     if (!addAttachment || !files.length) return;
     const oversized = files.filter((file) => file.size > MAX_ATTACHMENT_BYTES);

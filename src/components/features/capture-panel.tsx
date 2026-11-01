@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPoi
 import { AudioLines, FileAudio, FileImage, FileText, ImagePlus, Link2, Mic, Paperclip, PenLine, Square, Upload, X } from "lucide-react";
 import type { NewNote } from "@/lib/types";
 import { extractImageText, extractPdfText, htmlToPlainText } from "@/lib/features/extraction";
+import { escapeImportedText } from "@/lib/features/imported-text";
 import styles from "./capture-panel.module.css";
 
 export interface CapturePanelProps {
@@ -51,6 +52,9 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
   const [speechState, setSpeechState] = useState<"idle" | "listening" | "stopping">("idle");
   const [recordState, setRecordState] = useState<"idle" | "starting" | "recording" | "stopping">("idle");
   const [seconds, setSeconds] = useState(0);
+  const [notice, setNotice] = useState("");
+  const [overflowRecording, setOverflowRecording] = useState<{ blob: Blob; name: string } | null>(null);
+  const [overflowUrl, setOverflowUrl] = useState("");
   const [hasSketch, setHasSketch] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -79,6 +83,13 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
       stream.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
+
+  useEffect(() => {
+    if (!overflowRecording) { setOverflowUrl(""); return; }
+    const url = URL.createObjectURL(overflowRecording.blob);
+    setOverflowUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [overflowRecording]);
 
   useEffect(() => {
     if (recordState !== "recording") return;
@@ -142,6 +153,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
 
   const startRecording = async () => {
     setError("");
+    setNotice("");
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setError("Audio recording isn’t supported in this browser. You can attach an existing recording instead.");
       return;
@@ -151,10 +163,20 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
       const media = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (!mounted.current) { media.getTracks().forEach((track) => track.stop()); return; }
       stream.current = media;
-      const preferred = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"].find((type) => MediaRecorder.isTypeSupported(type));
+      const preferred = typeof MediaRecorder.isTypeSupported === "function" ? ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"].find((type) => MediaRecorder.isTypeSupported(type)) : undefined;
       const current = preferred ? new MediaRecorder(media, { mimeType: preferred }) : new MediaRecorder(media);
       const chunks: BlobPart[] = [];
-      current.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      let recordedBytes = 0;
+      let autoStopped = false;
+      current.ondataavailable = (event) => {
+        if (event.data.size) { chunks.push(event.data); recordedBytes += event.data.size; }
+        // Reserve space for the final chunk so recordings are not silently lost at the 10 MiB limit.
+        if (recordedBytes >= 9 * 1024 * 1024 && current.state === "recording") {
+          autoStopped = true;
+          if (mounted.current) { setNotice("Recording reached the attachment limit; finishing…"); setRecordState("stopping"); }
+          current.stop();
+        }
+      };
       current.onerror = () => { if (mounted.current) setError("The recording stopped unexpectedly. Please try again."); };
       current.onstop = () => {
         media.getTracks().forEach((track) => track.stop());
@@ -167,11 +189,19 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
         if (blob.size) {
           const extension = type.includes("mp4") ? "m4a" : type.includes("ogg") ? "ogg" : "webm";
           const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-          addFiles([new File([blob], `Recording-${stamp}.${extension}`, { type })]);
+          const name = `Recording-${stamp}.${extension}`;
+          if (blob.size > MAX_ATTACHMENT_BYTES) {
+            setNotice("");
+            setOverflowRecording({ blob, name });
+            setError("This recording exceeded 10 MiB and wasn’t attached. Download it below before discarding it.");
+          } else {
+            addFiles([new File([blob], name, { type })]);
+            if (autoStopped) setNotice("Recording stopped near the 10 MiB limit and was added to this note.");
+          }
         } else setError("No audio was captured. Please check your microphone and try again.");
       };
       recorder.current = current;
-      current.start();
+      current.start(1000);
       setSeconds(0);
       setRecordState("recording");
     } catch (cause) {
@@ -263,6 +293,8 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
     if (speechState !== "idle") { setError("Stop live transcription before saving."); return; }
     if (files.some((item) => item.state === "working")) { setError("Wait for text extraction or stop it before saving."); return; }
     if (hasSketch) { setError("Add your sketch to the note or clear it before saving."); setMode("sketch"); return; }
+    if (overflowRecording) { setError("Download or discard the oversized recording before saving."); setMode("voice"); return; }
+    let attemptedSave = false;
     try {
       const sections = [body.trim()];
       if (webUrl.trim()) {
@@ -273,16 +305,18 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
       }
       if (html.trim()) {
         const text = htmlToPlainText(html);
-        if (text) sections.push(`### Saved page text\n\n${text}`);
+        if (text) sections.push(`### Saved page text\n\n${escapeImportedText(text)}`);
         else throw new Error("The imported HTML didn’t contain any readable text.");
       }
-      if (transcript.trim()) sections.push(`### Live transcript\n\n${transcript.trim()}`);
-      for (const item of files) if (item.extracted) sections.push(`### Extracted from ${cleanName(item.file.name)}\n\n${item.extracted}`);
+      if (transcript.trim()) sections.push(`### Live transcript\n\n${escapeImportedText(transcript.trim())}`);
+      for (const item of files) if (item.extracted) sections.push(`### Extracted from ${escapeImportedText(cleanName(item.file.name))}\n\n${escapeImportedText(item.extracted)}`);
       setBusy(true);
+      attemptedSave = true;
       await onCreate({ title: title.trim() || "Untitled", body: sections.filter(Boolean).join("\n\n") }, files.map((item) => item.file));
       onClose();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Couldn’t save this capture. Please try again.");
+      const message = cause instanceof Error ? cause.message : "Couldn’t save this capture. Please try again.";
+      setError(`${message}${attemptedSave ? " A partial note may already be saved. Retry to finish, or close and find it in All notes." : ""}`);
     } finally {
       if (mounted.current) setBusy(false);
     }
@@ -294,10 +328,12 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
     <div className={styles.root}>
       <div className={styles.header}>
         <div className={styles.heading}><h2>Quick capture</h2><p>Get it down now. Make sense of it later.</p></div>
-        <button className={styles.close} type="button" onClick={onClose} aria-label="Close capture"><X size={17} /></button>
+        <button className={styles.close} type="button" onClick={onClose} disabled={busy} aria-label="Close capture"><X size={17} /></button>
       </div>
       <div className={styles.content}>
+        <fieldset className={styles.fields} disabled={busy}>
         {error && <p className={styles.error} role="alert">{error}</p>}
+        {notice && <p className={styles.copy} role="status" style={{ marginBottom: 12 }}>{notice}</p>}
         <div className={styles.field}><label className={styles.fieldLabel} htmlFor="capture-title">Title</label><input id="capture-title" className={styles.title} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Give this a name…" autoFocus /></div>
         <div className={styles.field}><label className={styles.fieldLabel} htmlFor="capture-body">Note <span style={{ fontWeight: 400 }}>(optional)</span></label><textarea id="capture-body" className={styles.body} value={body} onChange={(event) => setBody(event.target.value)} placeholder="A thought, a link, a little detail…" /></div>
         <div className={styles.tabs} role="tablist" aria-label="Capture format">
@@ -309,11 +345,12 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
           <p className={styles.copy} style={{ marginTop: 10 }}>For images, “Make searchable” runs English OCR in your browser. First use downloads recognition code and language data from public CDNs; the image is processed locally. Handwriting may be inaccurate.</p>
         </div>}
         {mode === "voice" && <div className={styles.captureBox} role="tabpanel">
-          <p className={styles.boxTitle}>Catch it in your own words</p><p className={styles.copy}>Record audio locally or attach an existing recording. Playback is available after saving.</p>
+          <p className={styles.boxTitle}>Catch it in your own words</p><p className={styles.copy}>Record audio locally or attach an existing recording. Playback is available after saving. Recordings stop near the 10 MiB attachment limit.</p>
           <div className={styles.actions}>
-            {recordState === "recording" ? <button type="button" className={`${styles.smallButton} ${styles.recording}`} onClick={stopRecording}><span className={styles.dot} /> Stop recording · {time}</button> : <button type="button" className={styles.smallButton} onClick={() => void startRecording()} disabled={recordState !== "idle"}><Mic size={14} /> {recordState === "starting" ? "Opening microphone…" : recordState === "stopping" ? "Finishing…" : "Record audio"}</button>}
+            {recordState === "recording" ? <button type="button" className={`${styles.smallButton} ${styles.recording}`} onClick={stopRecording}><span className={styles.dot} /> Stop recording · {time}</button> : <button type="button" className={styles.smallButton} onClick={() => void startRecording()} disabled={recordState !== "idle" || !!overflowRecording}><Mic size={14} /> {recordState === "starting" ? "Opening microphone…" : recordState === "stopping" ? "Finishing…" : "Record audio"}</button>}
             <button type="button" className={styles.smallButton} onClick={() => audioInput.current?.click()} disabled={recordState !== "idle"}><Upload size={14} /> Attach audio</button><input ref={audioInput} type="file" accept="audio/*" multiple hidden onChange={(event) => { addFiles(Array.from(event.target.files || [])); event.target.value = ""; }} />
           </div>
+          {overflowRecording && <div className={styles.transcript}><p style={{ margin: 0 }}>This recording is too large to attach. Download it, then discard this local copy to continue.</p><div className={styles.actions}>{overflowUrl && <a className={styles.smallButton} href={overflowUrl} download={overflowRecording.name}>Download recording</a>}<button type="button" className={styles.smallButton} onClick={() => { setOverflowRecording(null); setError(""); }}>Discard local copy</button></div></div>}
           <p className={styles.copy} style={{ marginTop: 12 }}>Optional live transcription uses your browser’s speech service, which may send audio to its provider. It listens only after you start it; existing audio files cannot be transcribed here.</p>
           <div className={styles.actions}>{speechState !== "idle" ? <button type="button" className={styles.smallButton} onClick={stopTranscription} disabled={speechState === "stopping"}><Square size={12} /> {speechState === "stopping" ? "Finishing transcript…" : "Stop live transcript"}</button> : <button type="button" className={styles.smallButton} onClick={startTranscription} disabled={!recognitionSupported}><AudioLines size={14} /> {recognitionSupported ? "Start live transcript" : "Live transcript unavailable"}</button>}</div>
           {(transcript || interim) && <div className={styles.transcript} aria-live="polite">{transcript}{interim && <span style={{ opacity: .6 }}> {interim}</span>}</div>}
@@ -336,6 +373,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
           const Icon = isImage(item.file) ? FileImage : isAudio(item.file) ? FileAudio : FileText;
           return <div className={styles.fileRow} key={item.id}><Icon className={styles.fileIcon} size={16} /><div className={styles.fileInfo}><div className={styles.fileName} title={item.file.name}>{fileLabel(item.file)}</div><div className={styles.fileStatus} aria-live="polite">{item.message}</div></div><div className={styles.fileActions}>{item.state === "working" ? <button type="button" className={styles.textButton} onClick={() => cancelExtraction(item.id)}>Stop</button> : isImage(item.file) && item.state !== "done" ? <button type="button" className={styles.textButton} onClick={() => void runExtraction(item, "image")}>Make searchable</button> : null}<button type="button" className={styles.remove} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button></div></div>;
         })}</div>}
+        </fieldset>
       </div>
       <div className={styles.footer}><span className={styles.privacy}>Files are stored on this device.</span><button type="button" className="button" onClick={onClose} disabled={busy}>Cancel</button><button type="button" className="button primary" onClick={() => void save()} disabled={busy || locked}>{busy ? "Saving…" : "Save note"}</button></div>
     </div>
