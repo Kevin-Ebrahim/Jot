@@ -131,6 +131,9 @@ test('private notes, inherited shares, direct shares, roles and comments enforce
     const comment = repo.addComment(editor, item.id, 'A useful comment');
     assert.equal(repo.listComments(viewer.id, item.id)[0].body, 'A useful comment');
     assert.throws(() => repo.deleteComment(viewer.id, item.id, comment.id), errorStatus(403));
+    repo.changeShare('note', owner.id, item.id, editor.email, 'viewer');
+    assert.throws(() => repo.deleteComment(editor.id, item.id, comment.id), errorStatus(403));
+    repo.changeShare('note', owner.id, item.id, editor.email, 'editor');
     repo.deleteComment(owner.id, item.id, comment.id);
     assert.deepEqual(repo.listComments(editor.id, item.id), []);
     repo.changeShare('note', owner.id, item.id, editor.email, null);

@@ -235,22 +235,27 @@ export class Repository {
     return rows.map((row) => ({ id: row.id, noteId: row.note_id, author: { id: row.author_id, email: row.author_email }, body: this.cipher.openText(row.body, `comment:${row.id}`), createdAt: row.created_at, updatedAt: row.updated_at }));
   }
   addComment(user: PublicUser, noteId: string, body: string): Comment {
-    const row = this.noteRow(user.id, noteId);
-    if (!row) throw new HttpError(404, 'Note not found');
-    if (row.role === 'viewer') throw new HttpError(403, 'This note is read-only');
-    const now = new Date().toISOString();
-    const comment = { id: randomUUID(), noteId, author: user, body, createdAt: now, updatedAt: now };
-    this.db.prepare('INSERT INTO comments (id, note_id, author_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(comment.id, noteId, user.id, this.cipher.sealText(body, `comment:${comment.id}`), now, now);
-    return comment;
+    return transaction(this.db, () => {
+      const row = this.noteRow(user.id, noteId);
+      if (!row) throw new HttpError(404, 'Note not found');
+      if (row.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+      const now = new Date().toISOString();
+      const comment = { id: randomUUID(), noteId, author: user, body, createdAt: now, updatedAt: now };
+      this.db.prepare('INSERT INTO comments (id, note_id, author_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(comment.id, noteId, user.id, this.cipher.sealText(body, `comment:${comment.id}`), now, now);
+      return comment;
+    });
   }
   deleteComment(userId: string, noteId: string, commentId: string): void {
-    const note = this.noteRow(userId, noteId);
-    if (!note) throw new HttpError(404, 'Note not found');
-    const comment = this.db.prepare('SELECT author_id FROM comments WHERE id = ? AND note_id = ?').get(commentId, noteId) as unknown as { author_id: string } | undefined;
-    if (!comment) throw new HttpError(404, 'Comment not found');
-    if (comment.author_id !== userId && note.role !== 'owner') throw new HttpError(403, 'Only the author or note owner can delete this comment');
-    this.db.prepare('DELETE FROM comments WHERE id = ?').run(commentId);
+    transaction(this.db, () => {
+      const note = this.noteRow(userId, noteId);
+      if (!note) throw new HttpError(404, 'Note not found');
+      if (note.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+      const comment = this.db.prepare('SELECT author_id FROM comments WHERE id = ? AND note_id = ?').get(commentId, noteId) as unknown as { author_id: string } | undefined;
+      if (!comment) throw new HttpError(404, 'Comment not found');
+      if (comment.author_id !== userId && note.role !== 'owner') throw new HttpError(403, 'Only the author or note owner can delete this comment');
+      this.db.prepare('DELETE FROM comments WHERE id = ?').run(commentId);
+    });
   }
   /** Authorize both before reading a body and inside the final write transaction. */
   requireAttachmentAccess(userId: string, noteId: string, write = false): void {
