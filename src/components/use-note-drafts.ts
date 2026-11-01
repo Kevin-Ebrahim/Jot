@@ -130,6 +130,10 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
       if (entry?.status === 'saved' && note.revision >= entry.baseRevision && (note.revision > entry.baseRevision || note.serverVersion !== entry.note.serverVersion || note.syncState !== entry.note.syncState || note.role !== entry.note.role)) {
         next[note.id] = { ...entry, note, baseRevision: note.revision };
         changed = true;
+      } else if (entry && entry.status !== 'saved' && note.role !== entry.note.role) {
+        // Permission changes apply immediately, but never replace unsaved text.
+        next[note.id] = { ...entry, note: { ...entry.note, role: note.role, syncState: note.syncState, serverVersion: note.serverVersion } };
+        changed = true;
       }
     }
     if (changed) { entriesRef.current = next; setEntries(next); }
