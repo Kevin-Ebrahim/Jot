@@ -266,13 +266,24 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
       const result = await pending;
       if (mounted.current && currentOperation === operation.current && workspaceRef.current.workspaceId === userId) {
         setLastSync(result);
+        if (result.errors.some((message) => /signed-in account changed|matching account|sign in required/i.test(message))) {
+          setSessionStatus('error');
+          setSessionError('The signed-in account changed or expired. Your local workspace has not been changed; check the session before syncing.');
+        }
         if (result.errors.length) setSyncMessage(result.errors.join(' '));
         else if (result.conflicts) setSyncMessage(`${result.conflicts} ${result.conflicts === 1 ? 'conflict needs' : 'conflicts need'} your attention. Your local changes were kept.`);
         else setSyncMessage(null);
       }
       return result;
     } catch (error) {
-      if (mounted.current && currentOperation === operation.current && workspaceRef.current.workspaceId === userId) setSyncMessage(messageForError(error));
+      if (mounted.current && currentOperation === operation.current && workspaceRef.current.workspaceId === userId) {
+        const message = messageForError(error);
+        setSyncMessage(message);
+        if (/signed-in account changed|matching account|sign in required/i.test(message)) {
+          setSessionStatus('error');
+          setSessionError('The signed-in account changed or expired. Your local workspace has not been changed; check the session before syncing.');
+        }
+      }
       throw error;
     } finally {
       if (syncInFlight.current === entry) syncInFlight.current = null;

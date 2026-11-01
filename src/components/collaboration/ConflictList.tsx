@@ -87,8 +87,8 @@ export function ConflictList({ active }: { active: boolean }) {
         </div>
         {expanded === conflict.id && <div className="collab-conflict-detail">
           <div className="collab-compare">
-            <div><div className="collab-list-heading">Your local version</div><strong>{titleOf(conflict.local)}</strong>{conflict.local.deletedAt && <span className="collab-hint">Marked deleted</span>}{bodyOf(conflict.local) !== null && <pre>{bodyOf(conflict.local) || '(empty)'}</pre>}</div>
-            <div><div className="collab-list-heading">Server version</div><strong>{titleOf(conflict.server)}</strong>{conflict.server.deletedAt && <span className="collab-hint">Marked deleted</span>}{bodyOf(conflict.server) !== null && <pre>{bodyOf(conflict.server) || '(empty)'}</pre>}</div>
+            <div><div className="collab-list-heading">Your local version</div><strong>{titleOf(conflict.local)}</strong>{conflict.local.deletedAt && <span className="collab-hint">Marked deleted</span>}{bodyOf(conflict.local) !== null && <pre tabIndex={0} aria-label="Local note text">{bodyOf(conflict.local) || '(empty)'}</pre>}</div>
+            <div><div className="collab-list-heading">Server version</div><strong>{titleOf(conflict.server)}</strong>{conflict.server.deletedAt && <span className="collab-hint">Marked deleted</span>}{bodyOf(conflict.server) !== null && <pre tabIndex={0} aria-label="Server note text">{bodyOf(conflict.server) || '(empty)'}</pre>}</div>
           </div>
           {staleChoice && <p className="collab-hint">One of the versions changed. Review the current versions and choose again.</p>}
           {!selected ? <div className="collab-actions collab-actions-start">

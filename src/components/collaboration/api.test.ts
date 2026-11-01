@@ -11,11 +11,12 @@ test('collaboration requests use same-origin credentials and CSRF only on writes
     calls.push({ path: String(input), init });
     return Response.json({ ok: true });
   };
-  await request('/api/auth/session', { csrfToken: 'token' });
+  await request('/api/notes/id/comments', { csrfToken: 'token', workspaceId: 'account-id' });
   await request('/api/notes/one/shares', { method: 'POST', csrfToken: 'token', workspaceId: 'account-id', body: { email: 'reader@example.test', role: 'viewer' } });
   assert.equal(calls[0].init?.credentials, 'same-origin');
   assert.equal(calls[0].init?.cache, 'no-store');
   assert.equal(new Headers(calls[0].init?.headers).get('X-CSRF-Token'), null);
+  assert.equal(new Headers(calls[0].init?.headers).get('X-Jot-Workspace'), 'account-id');
   assert.equal(new Headers(calls[1].init?.headers).get('X-CSRF-Token'), 'token');
   assert.equal(new Headers(calls[1].init?.headers).get('X-Jot-Workspace'), 'account-id');
   assert.equal(new Headers(calls[1].init?.headers).get('Content-Type'), 'application/json');
