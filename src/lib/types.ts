@@ -38,6 +38,9 @@ export interface Attachment {
   size: number;
   createdAt: string;
   blob: Blob;
+  deletedAt: string | null;
+  serverVersion: number | null;
+  syncState: SyncState;
 }
 
 export type NotePatch = Partial<Pick<Note, 'title' | 'body' | 'tags' | 'notebookId' | 'pinned'>>;

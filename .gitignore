@@ -14,3 +14,8 @@ next-env.d.ts
 *.db-*
 /data/
 .DS_Store
+
+# Local agent and preview environment artifacts
+/AGENTS.md
+/.openai/
+/.sites-runtime/
