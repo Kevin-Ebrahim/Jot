@@ -1,5 +1,5 @@
 import { getDatabase } from '../../../../server/db';
-import { login, sessionCookie } from '../../../../server/auth';
+import { login, sessionCookie, trustedClientIp } from '../../../../server/auth';
 import { json, readJson, requireSameOrigin, route } from '../../../../server/http';
 import { object } from '../../../../server/validation';
 export const runtime = 'nodejs';
@@ -8,7 +8,7 @@ export async function POST(req: Request): Promise<Response> {
   return route(async () => {
     requireSameOrigin(req);
     const input = object(await readJson(req, 4096));
-    const current = await login(getDatabase(), input.email, input.password);
+    const current = await login(getDatabase(), input.email, input.password, trustedClientIp(req));
     return json({ user: current.user, csrfToken: current.csrfToken }, 200, { 'Set-Cookie': sessionCookie(req, current.token) });
   });
 }

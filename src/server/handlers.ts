@@ -15,7 +15,8 @@ export function put(kind: Kind, req: Request, rawId: string): Promise<Response> 
   return route(async () => {
     requireSameOrigin(req);
     const db = getDatabase(); const current = requireSession(db, req); requireCsrf(req, current);
-    const id = v.id(rawId); const input = v.object(await readJson(req));
+    // JSON escaping can expand a valid 1M-character note to ~6 MiB.
+    const id = v.id(rawId); const input = v.object(await readJson(req, kind === 'note' ? 8 * 1024 * 1024 : 4096));
     const operationId = v.id(input.operationId, 'operationId'); const base = v.baseVersion(input.baseVersion);
     const repo = new Repository(db);
     return kind === 'note'

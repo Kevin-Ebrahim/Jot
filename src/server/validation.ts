@@ -35,7 +35,14 @@ export function text(value: unknown, label: string, max: number, allowEmpty = tr
   return value as string;
 }
 export function date(value: unknown, label: string): string {
-  if (typeof value !== 'string' || value.length > 32 || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) || !Number.isFinite(Date.parse(value))) fail(`Invalid ${label}`);
+  if (typeof value !== 'string' || value.length > 32) fail(`Invalid ${label}`);
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3}))?Z$/.exec(value as string);
+  if (!match) fail(`Invalid ${label}`);
+  const parsed = Date.parse(value as string);
+  const canonical = `${match![1]}.${(match![2] || '').padEnd(3, '0')}Z`;
+  // Date.parse normalizes invalid calendar dates such as February 30. A
+  // round-trip enforces the exact calendar time rather than silently changing it.
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== canonical) fail(`Invalid ${label}`);
   return value as string;
 }
 export function email(value: unknown): string {

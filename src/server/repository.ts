@@ -8,7 +8,7 @@ interface RecordRow { id: string; owner_id: string; version: number; data_json: 
 interface NoteRow extends RecordRow { notebook_id: string | null }
 interface RoleRow extends RecordRow { role: Role }
 interface NoteRoleRow extends NoteRow { role: Role }
-interface Receipt { target: string; payload_hash: string; response_json: string }
+interface Receipt { target: string; payload_hash: string; result_version: number; created_at: number }
 export interface Envelope<T> { note?: T; notebook?: T; version: number; role: Role }
 export interface Share { user: PublicUser; role: ShareRole }
 export interface Comment { id: string; noteId: string; author: PublicUser; body: string; createdAt: string; updatedAt: string }
@@ -25,16 +25,27 @@ function transaction<T>(db: DatabaseSync, fn: () => T): T {
   catch (error) { db.exec('ROLLBACK'); throw error; }
 }
 function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
-function receipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string): Record<string, unknown> | null {
-  const row = db.prepare('SELECT target, payload_hash, response_json FROM operations WHERE user_id = ? AND operation_id = ?')
+const RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_RECEIPTS_PER_ACCOUNT = 10_000;
+function receipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string): number | null {
+  const row = db.prepare('SELECT target, payload_hash, result_version, created_at FROM operations WHERE user_id = ? AND operation_id = ?')
     .get(userId, operationId) as unknown as Receipt | undefined;
   if (!row) return null;
+  if (row.created_at < Date.now() - RECEIPT_TTL_MS) {
+    db.prepare('DELETE FROM operations WHERE user_id = ? AND operation_id = ?').run(userId, operationId);
+    return null;
+  }
   if (row.target !== target || row.payload_hash !== payloadHash) throw new HttpError(409, 'Operation id was already used with different content');
-  return JSON.parse(row.response_json) as Record<string, unknown>;
+  return row.result_version;
 }
-function saveReceipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string, response: unknown): void {
-  db.prepare('INSERT INTO operations (user_id, operation_id, target, payload_hash, response_json) VALUES (?, ?, ?, ?, ?)')
-    .run(userId, operationId, target, payloadHash, JSON.stringify(response));
+function saveReceipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string, resultVersion: number): void {
+  const now = Date.now();
+  db.prepare('DELETE FROM operations WHERE created_at < ?').run(now - RECEIPT_TTL_MS);
+  db.prepare('INSERT INTO operations (user_id, operation_id, target, payload_hash, result_version, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(userId, operationId, target, payloadHash, resultVersion, now);
+  db.prepare(`DELETE FROM operations WHERE user_id = ? AND operation_id IN (
+    SELECT operation_id FROM operations WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
+  )`).run(userId, userId, MAX_RECEIPTS_PER_ACCOUNT);
 }
 function noteEnvelope(row: NoteRoleRow): { note: ServerNote; version: number; role: Role } {
   return { note: JSON.parse(row.data_json) as ServerNote, version: row.version, role: row.role };
@@ -92,9 +103,12 @@ export class Repository {
       const current = existing ? this.noteRow(userId, input.id) : undefined;
       if (existing && !current) throw new HttpError(404, 'Note not found');
       const prior = receipt(this.db, userId, operationId, target, payloadHash);
-      if (prior) {
+      if (prior !== null) {
         if (!current) throw new HttpError(404, 'Note not found');
-        return { ...(prior as unknown as { note: ServerNote; version: number; role: Role }), role: current.role };
+        // A later edit makes the original response unavailable; a conflict is
+        // safer than acknowledging the wrong version or retaining note bodies.
+        if (current.version !== prior) throw new HttpError(409, 'conflict', { serverVersion: current.version, serverNote: JSON.parse(current.data_json) });
+        return noteEnvelope(current);
       }
       if (current?.role === 'viewer') throw new HttpError(403, 'This note is read-only');
       if (existing && existing.version !== baseVersion) {
@@ -103,6 +117,9 @@ export class Repository {
       if (!existing && baseVersion !== 0) throw new HttpError(409, 'Note does not exist');
       if (existing && current?.role !== 'owner' && existing.notebook_id !== input.notebookId) {
         throw new HttpError(403, 'Only the owner can move a note');
+      }
+      if (existing && current?.role !== 'owner' && existing.deleted_at !== input.deletedAt) {
+        throw new HttpError(403, 'Only the owner can trash or restore a note');
       }
       let ownerId = existing?.owner_id || userId;
       // Direct access to a note does not imply access to its notebook. Check
@@ -125,7 +142,7 @@ export class Repository {
       const updated = this.noteRow(userId, input.id);
       if (!updated) throw new HttpError(403, 'No access to note');
       const response = noteEnvelope(updated);
-      saveReceipt(this.db, userId, operationId, target, payloadHash, response);
+      saveReceipt(this.db, userId, operationId, target, payloadHash, response.version);
       return response;
     });
   }
@@ -137,9 +154,10 @@ export class Repository {
       const current = existing ? this.notebookRow(userId, input.id) : undefined;
       if (existing && !current) throw new HttpError(404, 'Notebook not found');
       const prior = receipt(this.db, userId, operationId, target, payloadHash);
-      if (prior) {
+      if (prior !== null) {
         if (!current) throw new HttpError(404, 'Notebook not found');
-        return { ...(prior as unknown as { notebook: ServerNotebook; version: number; role: Role }), role: current.role };
+        if (current.version !== prior) throw new HttpError(409, 'conflict', { serverVersion: current.version, serverNotebook: JSON.parse(current.data_json) });
+        return notebookEnvelope(current);
       }
       if (current?.role === 'viewer') throw new HttpError(403, 'This notebook is read-only');
       if (existing && existing.version !== baseVersion) {
@@ -173,7 +191,7 @@ export class Repository {
       const updated = this.notebookRow(userId, input.id);
       if (!updated) throw new HttpError(403, 'No access to notebook');
       const response = notebookEnvelope(updated);
-      saveReceipt(this.db, userId, operationId, target, payloadHash, response);
+      saveReceipt(this.db, userId, operationId, target, payloadHash, response.version);
       return response;
     });
   }
@@ -254,10 +272,16 @@ export class Repository {
       const owner = this.db.prepare('SELECT owner_id FROM notes WHERE id = ?').get(noteId) as unknown as { owner_id: string };
       const total = this.db.prepare(`SELECT COALESCE(SUM(a.size), 0) AS total FROM attachments a
         JOIN notes n ON n.id = a.note_id WHERE n.owner_id = ? AND a.deleted_at IS NULL`).get(owner.owner_id) as unknown as { total: number };
+      const count = this.db.prepare(`SELECT COUNT(*) AS total FROM attachments a
+        JOIN notes n ON n.id = a.note_id WHERE n.owner_id = ?`).get(owner.owner_id) as unknown as { total: number };
       const configuredLimit = process.env.JOT_MAX_USER_STORAGE_BYTES;
       const quota = configuredLimit === undefined ? 1024 * 1024 * 1024 : Number(configuredLimit);
       if (!Number.isSafeInteger(quota) || quota < 0) throw new HttpError(500, 'Invalid storage quota configuration');
+      const configuredRecordLimit = process.env.JOT_MAX_USER_ATTACHMENT_RECORDS;
+      const recordQuota = configuredRecordLimit === undefined ? 10_000 : Number(configuredRecordLimit);
+      if (!Number.isSafeInteger(recordQuota) || recordQuota < 0) throw new HttpError(500, 'Invalid attachment record quota configuration');
       if (total.total + data.byteLength > quota) throw new HttpError(413, 'Attachment storage quota exceeded');
+      if (count.total >= recordQuota) throw new HttpError(413, 'Attachment record quota exceeded');
       this.db.prepare('INSERT INTO attachments (id, note_id, name, mime_type, size, created_at, deleted_at, sha256, data) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)')
         .run(attachmentId, noteId, name, mimeType, data.byteLength, createdAt, sha, data);
       return { id: attachmentId, noteId, name, mimeType, size: data.byteLength, createdAt, deletedAt: null };

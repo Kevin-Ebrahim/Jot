@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/server/db';
-import { login, logout, register, requireCsrf, session } from '../src/server/auth';
+import { login, logout, register, requireCsrf, session, trustedClientIp } from '../src/server/auth';
 import { HttpError } from '../src/server/errors';
 import { requireSameOrigin } from '../src/server/http';
 import { Repository } from '../src/server/repository';
+import { date } from '../src/server/validation';
 import type { ServerNote, ServerNotebook } from '../src/server/validation';
 
 const now = '2026-11-01T12:00:00.000Z';
@@ -79,6 +80,8 @@ test('CAS preserves the winning write and idempotency survives restart', () => {
     assert.throws(() => repo.putNote(alice.id, operation, 0, { ...original, body: 'mismatch' }), errorStatus(409));
     const winner = repo.putNote(alice.id, randomUUID(), 1, { ...original, body: 'Winner' });
     assert.equal(winner.version, 2);
+    // A retry after a subsequent writer must not acknowledge the wrong version.
+    assert.throws(() => repo.putNote(alice.id, operation, 0, original), errorStatus(409));
     assert.throws(() => repo.putNote(alice.id, randomUUID(), 1, { ...original, body: 'Offline draft' }), (error: unknown) => {
       assert.ok(error instanceof HttpError);
       assert.equal(error.status, 409);
@@ -87,6 +90,11 @@ test('CAS preserves the winning write and idempotency survives restart', () => {
       return true;
     });
     assert.equal(repo.listNotes(alice.id)[0].note.body, 'Winner');
+    const receiptColumns = db.prepare('PRAGMA table_info(operations)').all() as Array<{ name: string }>;
+    assert.ok(!receiptColumns.some(column => column.name === 'response_json'));
+    assert.ok(!(JSON.stringify(db.prepare('SELECT * FROM operations').all()).includes('Winner')));
+    db.prepare('UPDATE operations SET created_at = 0 WHERE operation_id = ?').run(operation);
+    assert.throws(() => repo.putNote(alice.id, operation, 0, original), errorStatus(409));
     const tombstone = repo.putNote(alice.id, randomUUID(), 2, { ...winner.note, deletedAt: now });
     assert.equal(tombstone.version, 3);
     assert.equal(repo.listNotes(alice.id)[0].note.deletedAt, now);
@@ -118,6 +126,7 @@ test('private notes, inherited shares, direct shares, roles and comments enforce
     assert.equal(repo.listNotes(editor.id)[0].role, 'editor');
     const edit = repo.putNote(editor.id, randomUUID(), 1, { ...item, body: 'Edited' });
     assert.equal(edit.version, 2);
+    assert.throws(() => repo.putNote(editor.id, randomUUID(), 2, { ...edit.note, deletedAt: now }), errorStatus(403));
     assert.throws(() => repo.putNote(editor.id, randomUUID(), 2, { ...edit.note, notebookId: null }), errorStatus(403));
     const comment = repo.addComment(editor, item.id, 'A useful comment');
     assert.equal(repo.listComments(viewer.id, item.id)[0].body, 'A useful comment');
@@ -127,6 +136,43 @@ test('private notes, inherited shares, direct shares, roles and comments enforce
     repo.changeShare('note', owner.id, item.id, editor.email, null);
     assert.deepEqual(repo.listNotes(editor.id), []);
     assert.throws(() => repo.listComments(editor.id, item.id), errorStatus(404));
+  } finally { db.close(); }
+});
+
+test('calendar dates must round-trip exactly and proxy IP headers are opt-in', () => {
+  assert.equal(date('2026-02-28T12:00:00.000Z', 'date'), '2026-02-28T12:00:00.000Z');
+  assert.equal(date('2024-02-29T12:00:00Z', 'date'), '2024-02-29T12:00:00Z');
+  assert.throws(() => date('2026-02-30T12:00:00.000Z', 'date'), errorStatus(400));
+  assert.throws(() => date('2023-02-29T12:00:00Z', 'date'), errorStatus(400));
+  const req = new Request('http://localhost:3000/', { headers: { 'x-real-ip': '203.0.113.42', 'x-forwarded-for': '198.51.100.42' } });
+  assert.equal(trustedClientIp(req), undefined);
+  process.env.JOT_TRUST_PROXY_IP_HEADER = 'x-real-ip';
+  try {
+    assert.equal(trustedClientIp(req), '203.0.113.42');
+    assert.throws(() => trustedClientIp(new Request(req.url, { headers: { 'x-real-ip': '203.0.113.42, 198.51.100.1' } })), errorStatus(400));
+    assert.throws(() => trustedClientIp(new Request(req.url)), errorStatus(400));
+  } finally { delete process.env.JOT_TRUST_PROXY_IP_HEADER; }
+});
+
+test('account-specific limits do not lock unrelated registrations', async () => {
+  const db = openDatabase(':memory:');
+  process.env.JOT_ALLOW_REGISTRATION = 'true';
+  try {
+    // Previously a single global 30-attempt bucket locked every account out.
+    for (let i = 0; i < 31; i++) await register(db, `independent-${i}@example.test`, 'a sufficiently long password');
+    assert.equal((db.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number }).count, 31);
+  } finally { db.close(); delete process.env.JOT_ALLOW_REGISTRATION; }
+});
+
+test('only one initial account can bootstrap unless registration is explicitly opened', async () => {
+  const db = openDatabase(':memory:');
+  try {
+    const attempts = await Promise.allSettled([
+      register(db, 'bootstrap-one@example.test', 'a sufficiently long password'),
+      register(db, 'bootstrap-two@example.test', 'a sufficiently long password'),
+    ]);
+    assert.equal(attempts.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(attempts.filter(result => result.status === 'rejected' && result.reason instanceof HttpError && result.reason.status === 403).length, 1);
   } finally { db.close(); }
 });
 
@@ -157,6 +203,7 @@ test('shared notebook editors can create notes; owner-only deletion moves notes 
 test('HTTP routes enforce session, CSRF, origin and server-side permissions', async () => {
   const directory = mkdtempSync(path.join(tmpdir(), 'jot-http-'));
   process.env.JOT_DATA_DIR = directory;
+  process.env.JOT_ALLOW_REGISTRATION = 'true';
   const origin = 'http://localhost:3000';
   const registerRoute = await import('../src/app/api/auth/register/route');
   const sessionRoute = await import('../src/app/api/auth/session/route');
@@ -185,6 +232,8 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     assert.equal((await registerRoute.POST(req('/api/auth/register', 'POST', { email: 'evil@example.test', password: 'a strong password here' }, undefined, undefined, 'https://evil.example'))).status, 403);
     const alice = await account('http-alice@example.test');
     const bob = await account('http-bob@example.test');
+    assert.equal((await notesRoute.GET(new Request(`${origin}/api/notes`, { headers: { cookie: alice.cookie, 'x-jot-workspace': bob.user.id } }))).status, 409);
+    assert.equal((await notesRoute.GET(new Request(`${origin}/api/notes`, { headers: { cookie: alice.cookie, 'x-jot-workspace': alice.user.id } }))).status, 200);
     const current = await sessionRoute.GET(req('/api/auth/session', 'GET', undefined, alice.cookie));
     assert.equal((await current.json()).user.email, alice.user.email);
     const item = note();
@@ -195,6 +244,10 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     const saved = await noteRoute.PUT(req(`/api/notes/${item.id}`, 'PUT', payload, alice.cookie, alice.csrfToken), ctx);
     assert.equal(saved.status, 200);
     assert.equal((await saved.json()).version, 1);
+    // Valid local text can exceed 1.2 MiB once JSON-escaped on the wire.
+    const large = note({ body: '\u0000'.repeat(250_000) });
+    const largeCtx = { params: Promise.resolve({ id: large.id }) };
+    assert.equal((await noteRoute.PUT(req(`/api/notes/${large.id}`, 'PUT', { baseVersion: 0, operationId: randomUUID(), note: large }, alice.cookie, alice.csrfToken), largeCtx)).status, 200);
     assert.deepEqual((await (await notesRoute.GET(req('/api/notes', 'GET', undefined, bob.cookie))).json()).notes, []);
     const share = await shareRoute.POST(req(`/api/notes/${item.id}/shares`, 'POST', { email: bob.user.email, role: 'viewer' }, alice.cookie, alice.csrfToken), ctx);
     assert.equal(share.status, 200);
@@ -209,6 +262,7 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     holder.__jotDatabase?.close();
     delete holder.__jotDatabase;
     delete process.env.JOT_DATA_DIR;
+    delete process.env.JOT_ALLOW_REGISTRATION;
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -216,6 +270,7 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
 test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async () => {
   const directory = mkdtempSync(path.join(tmpdir(), 'jot-attachments-'));
   process.env.JOT_DATA_DIR = directory;
+  process.env.JOT_ALLOW_REGISTRATION = 'true';
   const origin = 'http://localhost:3000';
   const registerRoute = await import('../src/app/api/auth/register/route');
   const noteRoute = await import('../src/app/api/notes/[id]/route');
@@ -245,7 +300,7 @@ test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async (
     const bytes = new TextEncoder().encode('<script>alert(1)</script>');
     function upload(who: typeof alice, data = bytes, foreignOrigin = origin): Request {
       return new Request(endpoint, { method: 'PUT', headers: { origin: foreignOrigin, cookie: who.cookie, 'x-csrf-token': who.csrfToken,
-        'x-jot-filename': encodeURIComponent('../../test.html'), 'x-jot-created-at': now, 'content-type': 'text/html' }, body: Uint8Array.from(data) });
+        'x-jot-filename': encodeURIComponent('../../te\u202est.html'), 'x-jot-created-at': now, 'content-type': 'text/html' }, body: Uint8Array.from(data) });
     }
     assert.equal((await itemRoute.PUT(upload(alice, bytes, 'https://evil.example'), attachmentCtx)).status, 403);
     assert.equal((await itemRoute.PUT(upload(bob), attachmentCtx)).status, 403);
@@ -253,7 +308,7 @@ test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async (
     const uploaded = await itemRoute.PUT(upload(alice), attachmentCtx);
     assert.equal(uploaded.status, 200);
     const metadata = (await uploaded.json()).attachment;
-    assert.equal(metadata.name, '.._.._test.html');
+    assert.equal(metadata.name, '.._.._te_st.html');
     assert.equal(metadata.mimeType, 'text/html');
     assert.equal(metadata.size, bytes.length);
     assert.equal((await itemRoute.PUT(upload(alice), attachmentCtx)).status, 200);
@@ -284,7 +339,52 @@ test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async (
   } finally {
     const holder = globalThis as typeof globalThis & { __jotDatabase?: DatabaseSync };
     holder.__jotDatabase?.close(); delete holder.__jotDatabase;
-    delete process.env.JOT_DATA_DIR; delete process.env.JOT_MAX_USER_STORAGE_BYTES;
+    delete process.env.JOT_DATA_DIR; delete process.env.JOT_MAX_USER_STORAGE_BYTES; delete process.env.JOT_ALLOW_REGISTRATION;
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('legacy receipts are migrated to bounded body-free records', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'jot-receipt-migration-'));
+  const filename = path.join(directory, 'jot.sqlite');
+  let db = openDatabase(filename);
+  try {
+    const alice = user(db, 'migration@example.test');
+    db.exec(`DROP TABLE operations; CREATE TABLE operations (
+      user_id TEXT NOT NULL REFERENCES users(id), operation_id TEXT NOT NULL,
+      target TEXT NOT NULL, payload_hash TEXT NOT NULL, response_json TEXT NOT NULL,
+      PRIMARY KEY (user_id, operation_id))`);
+    db.prepare('INSERT INTO operations VALUES (?, ?, ?, ?, ?)').run(alice.id, randomUUID(), 'note:old', 'abc', JSON.stringify({ version: 7, note: { body: 'private old response' } }));
+    db.close();
+    db = openDatabase(filename);
+    const rows = db.prepare('SELECT * FROM operations').all();
+    assert.equal((rows[0] as { result_version: number }).result_version, 7);
+    assert.ok(!JSON.stringify(rows).includes('private old response'));
+    const repo = new Repository(db);
+    db.prepare(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 10000)
+      INSERT INTO operations (user_id, operation_id, target, payload_hash, result_version, created_at)
+      SELECT ?, 'fake-' || x, 'note:fake', 'hash', 1, ? FROM n`).run(alice.id, Date.now());
+    repo.putNote(alice.id, randomUUID(), 0, note());
+    assert.equal((db.prepare('SELECT COUNT(*) AS count FROM operations WHERE user_id=?').get(alice.id) as { count: number }).count, 10_000);
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('zero-byte and deleted attachment records count toward an owner quota', () => {
+  const db = openDatabase(':memory:');
+  process.env.JOT_MAX_USER_STORAGE_BYTES = '0';
+  process.env.JOT_MAX_USER_ATTACHMENT_RECORDS = '2';
+  try {
+    const owner = user(db, 'quota@example.test');
+    const repo = new Repository(db);
+    const item = note();
+    repo.putNote(owner.id, randomUUID(), 0, item);
+    const a = randomUUID(), b = randomUUID();
+    repo.putAttachment(owner.id, item.id, a, 'empty.txt', 'text/plain', now, new Uint8Array());
+    repo.deleteAttachment(owner.id, item.id, a);
+    repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array());
+    assert.throws(() => repo.putAttachment(owner.id, item.id, randomUUID(), 'empty.txt', 'text/plain', now, new Uint8Array()), errorStatus(413));
+    assert.equal(repo.listAttachments(owner.id, item.id).length, 2);
+    // A valid retry does not consume another record.
+    assert.equal(repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array()).id, b);
+  } finally { db.close(); delete process.env.JOT_MAX_USER_STORAGE_BYTES; delete process.env.JOT_MAX_USER_ATTACHMENT_RECORDS; }
 });

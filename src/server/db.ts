@@ -18,6 +18,7 @@ export function openDatabase(filename: string): DatabaseSync {
     PRAGMA foreign_keys = ON;
     PRAGMA journal_mode = WAL;
     PRAGMA busy_timeout = 5000;
+    PRAGMA secure_delete = ON;
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       email TEXT NOT NULL UNIQUE,
@@ -86,10 +87,33 @@ export function openDatabase(filename: string): DatabaseSync {
       operation_id TEXT NOT NULL,
       target TEXT NOT NULL,
       payload_hash TEXT NOT NULL,
-      response_json TEXT NOT NULL,
+      result_version INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
       PRIMARY KEY(user_id, operation_id)
     );
   `);
+  // Earlier development snapshots stored entire response bodies. Migrate to
+  // minimal receipts, retaining only their versions and request fingerprints.
+  const operationColumns = db.prepare('PRAGMA table_info(operations)').all() as unknown as Array<{ name: string }>;
+  if (operationColumns.some((column) => column.name === 'response_json')) {
+    db.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE operations RENAME TO operations_legacy;
+      CREATE TABLE operations (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        operation_id TEXT NOT NULL, target TEXT NOT NULL, payload_hash TEXT NOT NULL,
+        result_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
+        PRIMARY KEY(user_id, operation_id)
+      );
+      INSERT INTO operations (user_id, operation_id, target, payload_hash, result_version, created_at)
+        SELECT user_id, operation_id, target, payload_hash,
+               CAST(json_extract(response_json, '$.version') AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER) * 1000
+        FROM operations_legacy WHERE json_valid(response_json) AND json_extract(response_json, '$.version') IS NOT NULL;
+      DROP TABLE operations_legacy;
+      COMMIT;
+    `);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS operations_created ON operations(created_at)');
   return db;
 }
 

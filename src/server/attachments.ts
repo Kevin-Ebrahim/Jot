@@ -14,8 +14,8 @@ function filename(req: Request): string {
   catch { throw new HttpError(400, 'Invalid attachment name'); }
   // Do not allow paths, control characters or header delimiters through to a
   // downloadable filename; this normalization is deterministic for retries.
-  const cleaned = decoded.replace(/[\\/\x00-\x1f\x7f]/g, '_').trim();
-  if (!cleaned || cleaned.length > 255) throw new HttpError(400, 'Invalid attachment name');
+  const cleaned = decoded.replace(/[\\/\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '_').trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..' || cleaned.length > 255) throw new HttpError(400, 'Invalid attachment name');
   return cleaned;
 }
 function mime(req: Request): string {
