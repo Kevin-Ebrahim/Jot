@@ -358,10 +358,13 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
 
   const authenticatedRequest = useCallback(async <T,>(path: string, options: RequestOptions = {}): Promise<T> => {
     if (!session?.user || !session.csrfToken || !workspaceReady) throw new Error('Check your account session before continuing.');
+    const userId = session.user.id;
+    const currentOperation = operation.current;
     try {
-      return await request<T>(path, { ...options, csrfToken: session.csrfToken, workspaceId: session.user.id });
+      return await request<T>(path, { ...options, csrfToken: session.csrfToken, workspaceId: userId });
     } catch (error) {
-      if (error instanceof CollaborationApiError && (error.status === 401 || (error.status === 403 && /csrf/i.test(error.message)) || (error.status === 409 && /account changed|workspace/i.test(error.message)))) {
+      if (mounted.current && currentOperation === operation.current && workspaceRef.current.workspaceId === userId
+          && error instanceof CollaborationApiError && (error.status === 401 || (error.status === 403 && /csrf/i.test(error.message)) || (error.status === 409 && /account changed|workspace/i.test(error.message)))) {
         setSessionStatus('error');
         setSessionError('Your session needs to be checked again. Your local workspace has not been changed.');
       }
