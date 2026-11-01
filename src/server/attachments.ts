@@ -26,6 +26,13 @@ function disposition(name: string): string {
   const encoded = encodeURIComponent(name).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
   return `attachment; filename="attachment"; filename*=UTF-8''${encoded}`;
 }
+function expectedNoteVersion(req: Request): number {
+  const raw = req.headers.get('x-jot-note-version');
+  if (!raw || !/^[1-9]\d*$/.test(raw)) throw new HttpError(400, 'X-Jot-Note-Version must be a positive integer');
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) throw new HttpError(400, 'X-Jot-Note-Version must be a positive integer');
+  return value;
+}
 export function attachmentList(req: Request, rawNoteId: string): Promise<Response> {
   return route(() => {
     const db = getDatabase(); const current = requireSession(db, req);
@@ -52,11 +59,12 @@ export function attachmentItem(req: Request, rawNoteId: string, rawAttachmentId:
     }
     requireSameOrigin(req); requireCsrf(req, current);
     repo.requireAttachmentAccess(current.user.id, noteId, true);
-    if (req.method === 'DELETE') return json({ attachment: repo.deleteAttachment(current.user.id, noteId, attachmentId) });
+    const version = expectedNoteVersion(req);
+    if (req.method === 'DELETE') return json({ attachment: repo.deleteAttachment(current.user.id, noteId, attachmentId, version) });
     const name = filename(req);
     const mimeType = mime(req);
     const createdAt = v.date(req.headers.get('x-jot-created-at'), 'createdAt');
     const data = await readBinary(req, MAX_ATTACHMENT_BYTES);
-    return json({ attachment: repo.putAttachment(current.user.id, noteId, attachmentId, name, mimeType, createdAt, data) });
+    return json({ attachment: repo.putAttachment(current.user.id, noteId, attachmentId, name, mimeType, createdAt, data, version) });
   });
 }

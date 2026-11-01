@@ -97,7 +97,7 @@ try {
   const attachmentPath = `/api/notes/${note.id}/attachments/${attachmentId}`;
   response = await json(`/api/notes/${note.id}/attachments`, { account: editor });
   assert.equal(response.value.attachments.length, 0);
-  const uploaded = await call(attachmentPath, { method: 'PUT', account: editor, headers: { 'Content-Type': 'text/plain', 'X-Jot-Filename': encodeURIComponent('private filename.txt'), 'X-Jot-Created-At': timestamp }, body: 'private attachment bytes' });
+  const uploaded = await call(attachmentPath, { method: 'PUT', account: editor, headers: { 'Content-Type': 'text/plain', 'X-Jot-Filename': encodeURIComponent('private filename.txt'), 'X-Jot-Created-At': timestamp, 'X-Jot-Note-Version': '2' }, body: 'private attachment bytes' });
   assert.equal(uploaded.status, 200, await uploaded.text());
   const downloaded = await call(attachmentPath, { account: owner });
   assert.equal(downloaded.headers.get('content-type'), 'application/octet-stream');

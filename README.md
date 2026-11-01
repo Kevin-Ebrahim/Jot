@@ -11,7 +11,13 @@ npm ci
 npm run dev
 ```
 
-Open the local address printed by Next.js (normally `http://localhost:3000`). For a production build:
+Open `http://localhost:3000`. This is the default trusted origin. If you use another hostname or port, set `JOT_APP_ORIGIN` to the exact address you will open in the browser; for example:
+
+```sh
+JOT_APP_ORIGIN=http://127.0.0.1:3215 npm run dev -- --hostname 127.0.0.1 --port 3215
+```
+
+For a production build:
 
 ```sh
 npm run build
@@ -36,7 +42,7 @@ IndexedDB in the browser is **not encrypted by Jot**. A full JSON backup include
 
 Server content is plaintext by default. For a **new, empty data directory only**, set `JOT_ENCRYPTION_KEY` to a securely generated 64-character hexadecimal key before the first start. Keep the same key for every restart and back it up separately from the database. Losing it makes encrypted content unreadable; existing plaintext databases are not silently migrated. This optional AES-256-GCM mode encrypts note/notebook content, comment text, and attachment filenames and bytes, but account emails and operational metadata remain visible. The running server can decrypt the content: it is **not end-to-end encryption**. It does not encrypt browser storage or exports automatically. See [server notes](src/server/README.md) for the precise scope and configuration.
 
-For any non-local deployment, use HTTPS and a trusted reverse proxy. Set `JOT_APP_ORIGIN` to the exact public origin and `JOT_SECURE_COOKIES=true` when TLS terminates at the proxy. Restrict registration and add proxy-level rate limits. Never commit keys, passwords, or database files.
+For any non-local deployment, use HTTPS and a trusted reverse proxy. Set `JOT_APP_ORIGIN` to the exact public origin (including any non-default port) and `JOT_SECURE_COOKIES=true` when TLS terminates at the proxy. Jot does not trust forwarded host headers to determine its CSRF origin. Restrict registration and add proxy-level rate limits. Never commit keys, passwords, or database files.
 
 ## Capture and organization
 

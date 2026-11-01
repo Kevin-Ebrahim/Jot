@@ -258,10 +258,11 @@ export class Repository {
     });
   }
   /** Authorize both before reading a body and inside the final write transaction. */
-  requireAttachmentAccess(userId: string, noteId: string, write = false): void {
+  requireAttachmentAccess(userId: string, noteId: string, write = false): number {
     const note = this.noteRow(userId, noteId);
     if (!note) throw new HttpError(404, 'Note not found');
     if (write && note.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+    return note.version;
   }
   listAttachments(userId: string, noteId: string): AttachmentMetadata[] {
     this.requireAttachmentAccess(userId, noteId);
@@ -269,10 +270,11 @@ export class Repository {
       .all(noteId) as unknown as AttachmentRow[];
     return rows.map((row) => attachmentMetadata(row, this.cipher));
   }
-  putAttachment(userId: string, noteId: string, attachmentId: string, name: string, mimeType: string, createdAt: string, data: Uint8Array): AttachmentMetadata {
+  putAttachment(userId: string, noteId: string, attachmentId: string, name: string, mimeType: string, createdAt: string, data: Uint8Array, expectedNoteVersion: number): AttachmentMetadata {
     const sha = this.cipher.fingerprint(data);
     return transaction(this.db, () => {
-      this.requireAttachmentAccess(userId, noteId, true);
+      const currentVersion = this.requireAttachmentAccess(userId, noteId, true);
+      if (currentVersion !== expectedNoteVersion) throw new HttpError(409, 'Note version changed; refresh before modifying attachments', { serverVersion: currentVersion });
       const existing = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at, sha256 FROM attachments WHERE id = ?')
         .get(attachmentId) as unknown as AttachmentRow | undefined;
       if (existing) {
@@ -307,9 +309,10 @@ export class Repository {
     if (!row || row.deleted_at || !row.data) throw new HttpError(404, 'Attachment not found');
     return { metadata: attachmentMetadata(row, this.cipher), data: this.cipher.openBytes(row.data, `attachment-data:${attachmentId}`) };
   }
-  deleteAttachment(userId: string, noteId: string, attachmentId: string): AttachmentMetadata {
+  deleteAttachment(userId: string, noteId: string, attachmentId: string, expectedNoteVersion: number): AttachmentMetadata {
     return transaction(this.db, () => {
-      this.requireAttachmentAccess(userId, noteId, true);
+      const currentVersion = this.requireAttachmentAccess(userId, noteId, true);
+      if (currentVersion !== expectedNoteVersion) throw new HttpError(409, 'Note version changed; refresh before modifying attachments', { serverVersion: currentVersion });
       const row = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at FROM attachments WHERE id = ? AND note_id = ?')
         .get(attachmentId, noteId) as unknown as AttachmentRow | undefined;
       if (!row) throw new HttpError(404, 'Attachment not found');

@@ -60,6 +60,17 @@ test('state-changing calls require exact origin', () => {
   assert.throws(() => requireSameOrigin(new Request(url)), errorStatus(403));
   assert.throws(() => requireSameOrigin(new Request(url, { headers: { origin: 'https://evil.example' } })), errorStatus(403));
   requireSameOrigin(new Request(url, { headers: { origin: 'http://localhost:3000' } }));
+  // Next can normalize the internal URL to localhost even if the browser is
+  // on 127.0.0.1; only the operator-set canonical origin defines trust.
+  const custom = new Request('http://localhost:3215/api/notes', { headers: { origin: 'http://127.0.0.1:3215', 'x-forwarded-host': '127.0.0.1:3215' } });
+  assert.throws(() => requireSameOrigin(custom), errorStatus(403));
+  process.env.JOT_APP_ORIGIN = 'http://127.0.0.1:3215';
+  try {
+    requireSameOrigin(custom);
+    assert.throws(() => requireSameOrigin(new Request(custom.url, { headers: { origin: 'http://localhost:3215', 'x-forwarded-host': '127.0.0.1:3215' } })), errorStatus(403));
+    process.env.JOT_APP_ORIGIN = 'http://127.0.0.1:3215/path';
+    assert.throws(() => requireSameOrigin(custom), errorStatus(500));
+  } finally { delete process.env.JOT_APP_ORIGIN; }
 });
 
 test('CAS preserves the winning write and idempotency survives restart', () => {
@@ -303,7 +314,7 @@ test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async (
     const bytes = new TextEncoder().encode('<script>alert(1)</script>');
     function upload(who: typeof alice, data = bytes, foreignOrigin = origin): Request {
       return new Request(endpoint, { method: 'PUT', headers: { origin: foreignOrigin, cookie: who.cookie, 'x-csrf-token': who.csrfToken,
-        'x-jot-filename': encodeURIComponent('../../te\u202est.html'), 'x-jot-created-at': now, 'content-type': 'text/html' }, body: Uint8Array.from(data) });
+        'x-jot-filename': encodeURIComponent('../../te\u202est.html'), 'x-jot-created-at': now, 'x-jot-note-version': '1', 'content-type': 'text/html' }, body: Uint8Array.from(data) });
     }
     assert.equal((await itemRoute.PUT(upload(alice, bytes, 'https://evil.example'), attachmentCtx)).status, 403);
     assert.equal((await itemRoute.PUT(upload(bob), attachmentCtx)).status, 403);
@@ -326,7 +337,7 @@ test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async (
     assert.match(download.headers.get('content-security-policy')!, /sandbox/);
     assert.deepEqual(new Uint8Array(await download.arrayBuffer()), bytes);
     assert.equal((await itemRoute.GET(new Request(endpoint, { headers: { cookie: stranger.cookie } }), attachmentCtx)).status, 404);
-    const remove = () => new Request(endpoint, { method: 'DELETE', headers: { origin, cookie: alice.cookie, 'x-csrf-token': alice.csrfToken } });
+    const remove = () => new Request(endpoint, { method: 'DELETE', headers: { origin, cookie: alice.cookie, 'x-csrf-token': alice.csrfToken, 'x-jot-note-version': '1' } });
     const deleted = (await (await itemRoute.DELETE(remove(), attachmentCtx)).json()).attachment;
     assert.ok(deleted.deletedAt);
     assert.deepEqual((await (await itemRoute.DELETE(remove(), attachmentCtx)).json()).attachment, deleted);
@@ -382,13 +393,13 @@ test('zero-byte and deleted attachment records count toward an owner quota', () 
     const item = note();
     repo.putNote(owner.id, randomUUID(), 0, item);
     const a = randomUUID(), b = randomUUID();
-    repo.putAttachment(owner.id, item.id, a, 'empty.txt', 'text/plain', now, new Uint8Array());
-    repo.deleteAttachment(owner.id, item.id, a);
-    repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array());
-    assert.throws(() => repo.putAttachment(owner.id, item.id, randomUUID(), 'empty.txt', 'text/plain', now, new Uint8Array()), errorStatus(413));
+    repo.putAttachment(owner.id, item.id, a, 'empty.txt', 'text/plain', now, new Uint8Array(), 1);
+    repo.deleteAttachment(owner.id, item.id, a, 1);
+    repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array(), 1);
+    assert.throws(() => repo.putAttachment(owner.id, item.id, randomUUID(), 'empty.txt', 'text/plain', now, new Uint8Array(), 1), errorStatus(413));
     assert.equal(repo.listAttachments(owner.id, item.id).length, 2);
     // A valid retry does not consume another record.
-    assert.equal(repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array()).id, b);
+    assert.equal(repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array(), 1).id, b);
   } finally { db.close(); delete process.env.JOT_MAX_USER_STORAGE_BYTES; delete process.env.JOT_MAX_USER_ATTACHMENT_RECORDS; }
 });
 
@@ -410,7 +421,7 @@ test('optional content-at-rest encryption authenticates key and encrypts all con
     const comment = repo.addComment(owner, item.id, 'uniquely secret comment');
     const attachmentId = randomUUID();
     const payload = new TextEncoder().encode('uniquely secret attachment bytes');
-    repo.putAttachment(owner.id, item.id, attachmentId, 'secret filename.txt', 'text/plain', now, payload);
+    repo.putAttachment(owner.id, item.id, attachmentId, 'secret filename.txt', 'text/plain', now, payload, 1);
     const rawNote = db.prepare('SELECT data_json FROM notes WHERE id=?').get(item.id) as { data_json: string };
     const rawBook = db.prepare('SELECT data_json FROM notebooks WHERE id=?').get(book.id) as { data_json: string };
     const rawComment = db.prepare('SELECT body FROM comments WHERE id=?').get(comment.id) as { body: string };
@@ -465,4 +476,65 @@ test('a plaintext database cannot silently switch to encrypted mode', () => {
     db = openDatabase(filename);
     assert.equal(new Repository(db).listNotes(owner.id)[0].note.body, 'still available');
   } finally { db?.close(); delete process.env.JOT_ENCRYPTION_KEY; rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('attachment mutations reject stale note versions even when an upload finishes late', { timeout: 10_000 }, async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'jot-attachment-version-'));
+  process.env.JOT_DATA_DIR = directory;
+  const origin = 'http://localhost:3000';
+  const registerRoute = await import('../src/app/api/auth/register/route');
+  const noteRoute = await import('../src/app/api/notes/[id]/route');
+  const listRoute = await import('../src/app/api/notes/[id]/attachments/route');
+  const itemRoute = await import('../src/app/api/notes/[id]/attachments/[attachmentId]/route');
+  const jsonReq = (url: string, body: unknown, cookie?: string, csrf?: string) => new Request(origin + url, {
+    method: 'PUT', headers: { origin, 'content-type': 'application/json', ...(cookie ? { cookie } : {}), ...(csrf ? { 'x-csrf-token': csrf } : {}) }, body: JSON.stringify(body),
+  });
+  try {
+    const registered = await registerRoute.POST(new Request(`${origin}/api/auth/register`, { method: 'POST', headers: { origin, 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'version-race@example.test', password: 'a sufficiently long password' }) }));
+    assert.equal(registered.status, 201);
+    const { csrfToken } = await registered.json();
+    const cookie = registered.headers.get('set-cookie')!.split(';')[0];
+    const item = note();
+    const noteCtx = { params: Promise.resolve({ id: item.id }) };
+    assert.equal((await noteRoute.PUT(jsonReq(`/api/notes/${item.id}`, { baseVersion: 0, operationId: randomUUID(), note: item }, cookie, csrfToken), noteCtx)).status, 200);
+    const attachmentId = randomUUID();
+    const endpoint = `${origin}/api/notes/${item.id}/attachments/${attachmentId}`;
+    const attachmentCtx = { params: Promise.resolve({ id: item.id, attachmentId }) };
+    const headers = { origin, cookie, 'x-csrf-token': csrfToken, 'x-jot-filename': 'one.txt', 'x-jot-created-at': now,
+      'x-jot-note-version': '1', 'content-type': 'text/plain' };
+    assert.equal((await itemRoute.PUT(new Request(endpoint, { method: 'PUT', headers, body: 'keep this' }), attachmentCtx)).status, 200);
+    assert.equal((await itemRoute.DELETE(new Request(endpoint, { method: 'DELETE', headers: { origin, cookie, 'x-csrf-token': csrfToken } }), attachmentCtx)).status, 400);
+    assert.equal((await itemRoute.DELETE(new Request(endpoint, { method: 'DELETE', headers: { ...headers, 'x-jot-note-version': '0' } }), attachmentCtx)).status, 400);
+
+    const lateId = randomUUID();
+    const lateCtx = { params: Promise.resolve({ id: item.id, attachmentId: lateId }) };
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let signalRead!: () => void;
+    const reading = new Promise<void>(resolve => { signalRead = resolve; });
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; }, pull() { signalRead(); } }, { highWaterMark: 0 });
+    // No bytes are available until after the competing note write. Pull means
+    // the route has already passed its initial ACL check and begun reading.
+    const pending = itemRoute.PUT(new Request(`${origin}/api/notes/${item.id}/attachments/${lateId}`, {
+      method: 'PUT', headers, body: stream, duplex: 'half',
+    } as RequestInit & { duplex: 'half' }), lateCtx);
+    await reading;
+    const changed = { ...item, body: 'server note changed while upload was in flight' };
+    assert.equal((await noteRoute.PUT(jsonReq(`/api/notes/${item.id}`, { baseVersion: 1, operationId: randomUUID(), note: changed }, cookie, csrfToken), noteCtx)).status, 200);
+    controller.enqueue(new TextEncoder().encode('stale bytes')); controller.close();
+    const lateResponse = await pending;
+    assert.equal(lateResponse.status, 409);
+    assert.equal((await lateResponse.json()).serverVersion, 2);
+    const listed = await listRoute.GET(new Request(`${origin}/api/notes/${item.id}/attachments`, { headers: { cookie } }), noteCtx);
+    assert.deepEqual((await listed.json()).attachments.map((entry: { id: string }) => entry.id), [attachmentId]);
+    const staleDelete = await itemRoute.DELETE(new Request(endpoint, { method: 'DELETE', headers }), attachmentCtx);
+    assert.equal(staleDelete.status, 409);
+    assert.equal((await itemRoute.GET(new Request(endpoint, { headers: { cookie } }), attachmentCtx)).status, 200);
+    const currentDelete = await itemRoute.DELETE(new Request(endpoint, { method: 'DELETE', headers: { ...headers, 'x-jot-note-version': '2' } }), attachmentCtx);
+    assert.equal(currentDelete.status, 200);
+  } finally {
+    const holder = globalThis as typeof globalThis & { __jotDatabase?: DatabaseSync };
+    holder.__jotDatabase?.close(); delete holder.__jotDatabase; delete process.env.JOT_DATA_DIR;
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

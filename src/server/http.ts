@@ -18,9 +18,17 @@ export async function route(handler: () => Promise<Response> | Response): Promis
 export function requireSameOrigin(req: Request): void {
   const supplied = req.headers.get('origin');
   let expected: string;
-  try { expected = new URL(process.env.JOT_APP_ORIGIN || req.url).origin; }
+  try {
+    // Never derive the trust boundary from Host or forwarded headers. Next may
+    // normalize req.url's hostname, so deployments must set a canonical origin
+    // when not using the default localhost:3000 address.
+    const configured = new URL(process.env.JOT_APP_ORIGIN || 'http://localhost:3000');
+    if (!['http:', 'https:'].includes(configured.protocol) || configured.username || configured.password ||
+        configured.pathname !== '/' || configured.search || configured.hash) throw new Error('Invalid origin');
+    expected = configured.origin;
+  }
   catch { throw new HttpError(500, 'Invalid server origin configuration'); }
-  if (!supplied || supplied !== expected) throw new HttpError(403, 'Origin not allowed');
+  if (!supplied || supplied !== expected) throw new HttpError(403, 'Origin not allowed; set JOT_APP_ORIGIN to the exact application origin including its port');
 }
 export async function readJson(req: Request, limit = 1_200_000): Promise<unknown> {
   if (!/^application\/json(?:\s*;|$)/i.test(req.headers.get('content-type') || '')) throw new HttpError(415, 'Expected application/json');
