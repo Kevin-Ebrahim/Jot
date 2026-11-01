@@ -105,7 +105,12 @@ export function AttachmentList({ noteId, listAttachments, addAttachment, deleteA
         setItemsNoteId(noteId);
         setError("");
       }
-    } catch (cause) { if (request === generation.current && currentNote.current === noteId) setError(cause instanceof Error ? cause.message : "Couldn’t load attachments."); }
+    } catch (cause) {
+      if (request === generation.current && currentNote.current === noteId) {
+        setItems([]); setItemsNoteId(noteId);
+        setError(cause instanceof Error ? cause.message : "Couldn’t load attachments.");
+      }
+    }
   }, [listAttachments, noteId]);
   useEffect(() => { setItems([]); setBusy(false); void reload(); return () => { generation.current += 1; }; }, [reload, refreshKey]);
   useEffect(() => subscribeStore(() => { void reload(); }), [reload]);
@@ -121,10 +126,11 @@ export function AttachmentList({ noteId, listAttachments, addAttachment, deleteA
   const remove = deleteAttachment ? async (id: string) => { await deleteAttachment(id); await reload(); } : undefined;
   // Never render one note's cached attachments while another note is loading.
   const visibleItems = itemsNoteId === noteId ? items : [];
-  if (!visibleItems.length && !addAttachment && !error) return null;
+  const visibleError = itemsNoteId === noteId ? error : "";
+  if (!visibleItems.length && !addAttachment && !visibleError) return null;
   return <section className={styles.root} aria-label="Attachments">
     <div className={styles.header}><h3 className={styles.heading}>Attachments <span className={styles.count}>{visibleItems.length}</span></h3>{addAttachment && <><button type="button" className={styles.add} onClick={() => input.current?.click()} disabled={busy}><Plus size={13} /> Add file</button><input type="file" ref={input} multiple hidden onChange={(event) => { void add(Array.from(event.target.files || [])); event.target.value = ""; }} /></>}</div>
-    {error && <p className={styles.error} role="alert">{error}</p>}
+    {visibleError && <p className={styles.error} role="alert">{visibleError}</p>}
     <div className={styles.list}>{visibleItems.map((item) => <AttachmentCard key={item.id} attachment={item} onDelete={remove} onAppendText={onAppendText} />)}</div>
     {onAppendText && visibleItems.some(isImage) && <p className={styles.hint}>English image OCR runs locally. Its code and language data download from public CDNs on first use; handwriting may be inaccurate.</p>}
   </section>;
