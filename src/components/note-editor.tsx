@@ -16,6 +16,9 @@ import type { NoteDraft } from './use-note-drafts';
 type Props = {
   draft: NoteDraft;
   busy?: boolean;
+  forceReadOnly?: boolean;
+  recoveryAvailable?: boolean;
+  onCopyUnavailable: () => Promise<void>;
   notes: Note[];
   notebooks: Notebook[];
   onChange: (patch: NotePatch) => void;
@@ -50,9 +53,9 @@ function renderWikiLinks(body: string) {
   }).join('');
 }
 
-export function NoteEditor({ draft, busy = false, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText }: Props) {
+export function NoteEditor({ draft, busy = false, forceReadOnly = false, recoveryAvailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText }: Props) {
   const note = draft.note;
-  const viewer = note.role === 'viewer';
+  const viewer = forceReadOnly || note.role === 'viewer';
   const readOnly = viewer || busy;
   const [mode, setMode] = useState<'write' | 'preview'>('preview');
   const [addingTag, setAddingTag] = useState(false);
@@ -63,6 +66,9 @@ export function NoteEditor({ draft, busy = false, notes, notebooks, onChange, on
   const [scheduleInterval, setScheduleInterval] = useState<'daily' | 'weekly' | 'monthly' | 'yearly'>('weekly');
   const [scheduleDate, setScheduleDate] = useState('');
   const [scheduleError, setScheduleError] = useState('');
+  const [recoverConfirm, setRecoverConfirm] = useState(false);
+  const [recoverBusy, setRecoverBusy] = useState(false);
+  const [recoverError, setRecoverError] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
   const tagRef = useRef<HTMLInputElement>(null);
@@ -82,6 +88,7 @@ export function NoteEditor({ draft, busy = false, notes, notebooks, onChange, on
     setMenuOpen(false);
     setConflictChoice(null);
     setScheduleOpen(false);
+    setRecoverConfirm(false); setRecoverError('');
     if (!note.title && !note.body && !viewer) requestAnimationFrame(() => titleRef.current?.focus());
   }, [note.id]);
   useEffect(() => { if (draft.status !== 'conflict') setConflictChoice(null); }, [draft.status]);
@@ -164,13 +171,13 @@ export function NoteEditor({ draft, busy = false, notes, notebooks, onChange, on
           <div className="header-divider" />
           <div className="popover-wrap" ref={menuRef}>
             <button className="icon-button" disabled={busy} onClick={() => setMenuOpen((open) => !open)} title="More note actions" aria-label="More note actions" aria-expanded={menuOpen}><MoreHorizontal size={18} /></button>
-            {menuOpen && <div className="small-menu" role="menu"><button role="menuitem" disabled={note.role !== 'owner'} onClick={() => { setMenuOpen(false); onTrash(); }}><Trash2 size={14} /> Move to trash</button></div>}
+            {menuOpen && <div className="small-menu" role="menu"><button role="menuitem" disabled={viewer || note.role !== 'owner'} onClick={() => { setMenuOpen(false); onTrash(); }}><Trash2 size={14} /> Move to trash</button></div>}
           </div>
         </div>
       </header>
       <div className="editor-scroll">
         <article className="editor-document">
-          {(draft.status === 'conflict' || draft.status === 'error') && <div className="notice danger editor-notice" role="alert">
+          {!recoveryAvailable && (draft.status === 'conflict' || draft.status === 'error') && <div className="notice danger editor-notice" role="alert">
             <CircleAlert size={16} />
             <div><strong>{draft.status === 'conflict' ? 'This note changed elsewhere' : 'Your changes could not be saved'}</strong>
               {draft.status === 'conflict' ? 'Your draft is still here. Compare it with the latest saved version before choosing.' : `${draft.error || 'Try saving again.'} Your draft is still here.`}
@@ -179,7 +186,9 @@ export function NoteEditor({ draft, busy = false, notes, notebooks, onChange, on
               <div className="notice-actions">{draft.status === 'conflict' ? conflictChoice ? <><button className="button" onClick={() => { if (conflictChoice === 'mine') onKeepMine(); else onUseLatest(); }}>{conflictChoice === 'mine' ? 'Confirm overwrite' : 'Confirm discard'}</button><button className="button ghost" onClick={() => setConflictChoice(null)}>Cancel</button></> : <><button className="button" onClick={() => setConflictChoice('mine')}>Keep my draft</button><button className="button ghost" onClick={() => setConflictChoice('latest')}>Use latest version</button></> : <button className="button" onClick={onRetry}>Retry save</button>}</div>
             </div>
           </div>}
-          {viewer && <div className="notice editor-notice"><Eye size={15} /><span>You have view-only access to this note.</span></div>}
+          {recoveryAvailable ? <div className="notice editor-notice recovery-notice"><CircleAlert size={15} /><div><strong>This shared note is no longer available</strong>Your local version and any visible draft are still here. You can make a personal copy, including its local files.
+            {recoverConfirm ? <><p className="conflict-confirm">The new copy will be in your Inbox and queued to sync to this account. Reconnect and sign in if needed. The original stays read-only.</p><div className="notice-actions"><button className="button" disabled={recoverBusy} onClick={() => { setRecoverBusy(true); setRecoverError(''); void onCopyUnavailable().catch((error) => setRecoverError(error instanceof Error ? error.message : 'Could not make a copy.')).finally(() => setRecoverBusy(false)); }}>{recoverBusy ? 'Copying…' : 'Confirm personal copy'}</button><button className="button ghost" disabled={recoverBusy} onClick={() => setRecoverConfirm(false)}>Cancel</button></div></> : <div className="notice-actions"><button className="button" onClick={() => setRecoverConfirm(true)}>Make personal copy</button></div>}
+            {recoverError && <p className="dialog-error" role="alert">{recoverError}</p>}</div></div> : viewer && <div className="notice editor-notice"><Eye size={15} /><span>You have view-only access to this note.</span></div>}
           <input ref={titleRef} aria-label="Note title" className="note-title-input" value={note.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="Untitled note" maxLength={300} readOnly={readOnly} />
           <div className="note-properties">
             <span className="property"><CalendarDays size={13} /> Edited <strong>{shortDate(note.updatedAt)}</strong></span>

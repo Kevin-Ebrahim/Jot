@@ -161,6 +161,11 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
       if (entriesRef.current[id]?.status !== 'saved') throw new Error('Could not save every draft. Resolve the note before switching workspaces.');
     }
   }, []);
+  const acceptPersisted = useCallback((note: Note) => {
+    clearTimeout(timers.current[note.id]);
+    const entry = entriesRef.current[note.id];
+    writeEntry(note.id, { note, baseRevision: note.revision, status: 'saved', sequence: (entry?.sequence || 0) + 1 });
+  }, [writeEntry]);
   const reset = useCallback(() => {
     Object.values(timers.current).forEach(clearTimeout);
     timers.current = {};
@@ -168,5 +173,5 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     setEntries({});
   }, []);
 
-  return { entries, get, change, save, keepMine, useLatest, retry, flushAll, reset };
+  return { entries, get, change, save, keepMine, useLatest, retry, flushAll, acceptPersisted, reset };
 }
