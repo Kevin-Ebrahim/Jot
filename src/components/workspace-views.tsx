@@ -4,7 +4,7 @@ import { useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { ArrowDownToLine, ArrowUpFromLine, CalendarDays, Check, ChevronRight, FileText, PanelLeft, RotateCcw } from 'lucide-react';
 import type { NewNote, Note } from '@/lib/types';
-import { createFromTemplate, extractTasks, getDueReviews, getPriorMeetings, getResurfacedNotes, NOTE_TEMPLATES } from '@/lib/features';
+import { createFromTemplate, extractTasks, getDueReviews, getPriorMeetings, getRecurringSchedule, getResurfacedNotes, NOTE_TEMPLATES, setRecurringSchedule } from '@/lib/features';
 import type { View } from './sidebar';
 
 type Props = {
@@ -17,6 +17,7 @@ type Props = {
   onOpenNote: (id: string) => void;
   onToggleTask: (noteId: string, lineIndex: number) => void;
   onReviewed: (noteId: string) => void;
+  onCreateRecurring: (source: Note) => Promise<void>;
   onCreate: (input: NewNote) => Promise<void>;
   onRestore: (note: Note) => Promise<void>;
   onExport: (password?: string) => Promise<Blob>;
@@ -40,21 +41,26 @@ function download(blob: Blob, name: string) {
 }
 
 export function WorkspaceViews(props: Props) {
-  const { view, notes, deletedNotes, theme, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
+  const { view, notes, deletedNotes, theme, onTheme, onOpenSidebar, onOpenNote, onToggleTask, onReviewed, onCreateRecurring, onCreate, onRestore, onExport, onExportMarkdown, onImport, onAccount } = props;
   const tasks = useMemo(() => extractTasks(notes), [notes]);
   const resurfaced = useMemo(() => getResurfacedNotes(notes, new Date(), 20), [notes]);
   const meetings = useMemo(() => getPriorMeetings(notes, new Date(), 5), [notes]);
   const dueReviews = useMemo(() => getDueReviews(notes, new Date(), 20), [notes]);
+  const schedules = useMemo(() => notes.flatMap((note) => { const schedule = getRecurringSchedule(note); return schedule ? [{ note, ...schedule }] : []; }).sort((a, b) => a.dueAt.localeCompare(b.dueAt)), [notes]);
   const [password, setPassword] = useState('');
   const [importPassword, setImportPassword] = useState('');
   const [importFile, setImportFile] = useState<File | null>(null);
   const [working, setWorking] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleTitle, setScheduleTitle] = useState('');
+  const [scheduleInterval, setScheduleInterval] = useState<'daily' | 'weekly' | 'monthly' | 'yearly'>('weekly');
+  const [scheduleDate, setScheduleDate] = useState(() => { const date = new Date(); return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-'); });
   const [feedback, setFeedback] = useState<{ text: string; error?: boolean } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const reducedMotion = useReducedMotion();
   const run = async (action: () => Promise<void>, success: string) => {
     setWorking(true); setFeedback(null);
-    try { await action(); setFeedback({ text: success }); }
+    try { await action(); if (success) setFeedback({ text: success }); }
     catch (error) { setFeedback({ text: error instanceof Error ? error.message : 'Something went wrong. Please try again.', error: true }); }
     finally { setWorking(false); }
   };
@@ -62,13 +68,18 @@ export function WorkspaceViews(props: Props) {
   if (view.kind === 'tasks') {
     const open = tasks.filter((task) => !task.done).sort((a, b) => (a.dueAt || '9999').localeCompare(b.dueAt || '9999'));
     const done = tasks.filter((task) => task.done);
+    const today = new Date();
+    const todayKey = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-');
+    const reminders = open.filter((task) => task.remindAt && task.remindAt <= todayKey);
+    const otherOpen = open.filter((task) => !task.remindAt || task.remindAt > todayKey);
     const taskRows = (items: typeof tasks) => items.map((task) => <div className={`view-row ${task.done ? 'task-done' : ''}`} key={task.id}>
       <input className="task-check" type="checkbox" checked={task.done} disabled={notes.find((note) => note.id === task.noteId)?.role === 'viewer'} onChange={() => onToggleTask(task.noteId, task.lineIndex)} aria-label={`${task.done ? 'Reopen' : 'Complete'} ${task.text || 'task'}`} />
       <div className="view-row-main"><span className="view-row-title">{task.text || 'Untitled task'}</span><span className="view-row-description"><button className="text-button muted-link" onClick={() => onOpenNote(task.noteId)}>{task.noteTitle || 'Untitled note'}</button>{task.dueAt && ` · Due ${formatDay(task.dueAt)}`}{task.remindAt && ` · Reminder ${formatDay(task.remindAt)}`}{task.repeat && ` · Repeats ${task.repeat}`}</span></div>
       <button className="icon-button view-row-action" onClick={() => onOpenNote(task.noteId)} aria-label={`Open ${task.noteTitle || 'note'}`}><ChevronRight size={16} /></button>
     </div>);
     return <main className="workspace-view"><div className="workspace-view-inner"><ViewHeading title="Tasks" description="A clear view of the checkboxes in your notes." onOpenSidebar={onOpenSidebar} />
-      <section className="view-section"><h2>To do · {open.length}</h2>{open.length ? taskRows(open) : <div className="empty-view"><strong>All clear.</strong>Add a task in any note with <code>- [ ]</code> and it will appear here.</div>}</section>
+      {reminders.length > 0 && <section className="view-section"><h2>Reminders due · {reminders.length}</h2>{taskRows(reminders)}</section>}
+      <section className="view-section"><h2>To do · {otherOpen.length}</h2>{otherOpen.length ? taskRows(otherOpen) : open.length ? <div className="empty-view">Your remaining tasks are listed under reminders.</div> : <div className="empty-view"><strong>All clear.</strong>Add a task in any note with <code>- [ ]</code> and it will appear here.</div>}</section>
       {done.length > 0 && <section className="view-section"><h2>Completed · {done.length}</h2>{taskRows(done)}</section>}
       <p className="view-footnote">Add <code>@due(YYYY-MM-DD)</code>, <code>@remind(YYYY-MM-DD)</code>, or <code>@repeat(weekly)</code> to a task. Reminders are shown here; Jot does not send background alerts.</p>
     </div></main>;
@@ -82,13 +93,23 @@ export function WorkspaceViews(props: Props) {
   }
   if (view.kind === 'templates') {
     return <main className="workspace-view"><div className="workspace-view-inner"><ViewHeading title="Templates" description="A useful place to start, ready to make your own." onOpenSidebar={onOpenSidebar} />
-      <section className="view-section">{NOTE_TEMPLATES.map((template) => <div className="view-row" key={template.id}><div className="template-icon"><FileText size={16} /></div><div className="view-row-main"><span className="view-row-title">{template.name}</span><span className="view-row-description">{template.description}</span></div><button className="button" onClick={() => { void onCreate(createFromTemplate(template)); }}>Use template</button></div>)}</section>
-      <p className="view-footnote">Templates create an editable note. They don’t create notes automatically.</p>
+      {feedback?.error && <p className="dialog-error" role="alert">{feedback.text}</p>}
+      <section className="view-section"><div className="section-heading-row"><h2>Recurring notes</h2><button className="text-button" onClick={() => setScheduleOpen((open) => !open)}>{scheduleOpen ? 'Cancel' : 'New recurring note'}</button></div>
+        {scheduleOpen && <form className="schedule-form" onSubmit={(event) => { event.preventDefault(); void run(async () => { if (!scheduleTitle.trim()) throw new Error('Give the recurring note a title.'); const body = setRecurringSchedule('', scheduleInterval, scheduleDate); await onCreate({ title: scheduleTitle.trim(), body, tags: ['recurring'] }); }, ''); }}>
+          <label>Title<input className="field" value={scheduleTitle} maxLength={300} onChange={(event) => setScheduleTitle(event.target.value)} placeholder="e.g. Weekly planning · {{date}}" required /></label>
+          <label>Repeat<select className="field" value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value as typeof scheduleInterval)}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="yearly">Yearly</option></select></label>
+          <label>First date<input className="field" type="date" value={scheduleDate} onChange={(event) => setScheduleDate(event.target.value)} required /></label>
+          <p>Create an editable source note, then use “Create next” when you’re ready. Add <code>{'{{date}}'}</code> to insert the scheduled date.</p><button className="button primary" disabled={working}>Create source note</button>
+        </form>}
+        {schedules.length ? schedules.map(({ note, interval, dueAt }) => <div className="view-row" key={note.id}><div className="view-row-main"><button className="text-button view-row-title" onClick={() => onOpenNote(note.id)}>{note.title || 'Untitled note'}</button><span className="view-row-description">{interval[0].toUpperCase() + interval.slice(1)} · next {formatDay(dueAt)}</span></div><button className="button" disabled={working || note.role === 'viewer'} onClick={() => { void run(() => onCreateRecurring(note), ''); }}>Create next</button></div>) : !scheduleOpen && <div className="empty-view">Create a recurring source note, or add a schedule to an existing note.</div>}
+        <p className="view-footnote">Occurrences are created when you choose “Create next”—not automatically in the background.</p>
+      </section>
+      <section className="view-section"><h2>Start from a template</h2>{NOTE_TEMPLATES.map((template) => <div className="view-row" key={template.id}><div className="template-icon"><FileText size={16} /></div><div className="view-row-main"><span className="view-row-title">{template.name}</span><span className="view-row-description">{template.description}</span></div><button className="button" disabled={working} onClick={() => { void run(() => onCreate(createFromTemplate(template)), ''); }}>Use template</button></div>)}</section>
     </div></main>;
   }
   if (view.kind === 'trash') {
     return <main className="workspace-view"><div className="workspace-view-inner"><ViewHeading title="Trash" description="Notes you’ve removed are kept here until you restore them." onOpenSidebar={onOpenSidebar} />
-      <section className="view-section">{deletedNotes.length ? deletedNotes.map((note) => <div className="view-row" key={note.id}><FileText size={17} /><div className="view-row-main"><span className="view-row-title">{note.title || 'Untitled note'}</span><span className="view-row-description">Removed {note.deletedAt ? new Date(note.deletedAt).toLocaleDateString() : ''}</span></div><button className="button" disabled={note.role !== 'owner'} onClick={() => { void onRestore(note); }}><RotateCcw size={14} /> Restore</button></div>) : <div className="empty-view"><strong>Trash is empty.</strong>Removed notes will be kept here.</div>}</section>
+      <section className="view-section">{feedback?.error && <p className="dialog-error" role="alert">{feedback.text}</p>}{deletedNotes.length ? deletedNotes.map((note) => <div className="view-row" key={note.id}><FileText size={17} /><div className="view-row-main"><span className="view-row-title">{note.title || 'Untitled note'}</span><span className="view-row-description">Removed {note.deletedAt ? new Date(note.deletedAt).toLocaleDateString() : ''}</span></div><button className="button" disabled={note.role !== 'owner' || working} onClick={() => { void run(() => onRestore(note), ''); }}><RotateCcw size={14} /> Restore</button></div>) : <div className="empty-view"><strong>Trash is empty.</strong>Removed notes will be kept here.</div>}</section>
     </div></main>;
   }
   return <main className="workspace-view"><div className="workspace-view-inner"><ViewHeading title="Settings" description="Make Jot feel like yours, and keep a copy of what matters." onOpenSidebar={onOpenSidebar} />

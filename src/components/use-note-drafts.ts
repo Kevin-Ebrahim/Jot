@@ -127,7 +127,7 @@ export function useNoteDrafts(notes: Note[], updateNote: UpdateNote) {
     const next = { ...entriesRef.current };
     for (const note of notes) {
       const entry = next[note.id];
-      if (entry?.status === 'saved' && note.revision > entry.baseRevision) {
+      if (entry?.status === 'saved' && note.revision >= entry.baseRevision && (note.revision > entry.baseRevision || note.serverVersion !== entry.note.serverVersion || note.syncState !== entry.note.syncState || note.role !== entry.note.role)) {
         next[note.id] = { ...entry, note, baseRevision: note.revision };
         changed = true;
       }

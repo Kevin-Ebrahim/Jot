@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Archive, BookOpen, CheckSquare2, ChevronDown, CircleHelp, FileText, Folder,
   Inbox, LayoutTemplate, MoreHorizontal, Plus, Search, Settings2, Sparkles,
@@ -29,6 +29,16 @@ type Props = {
 
 export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavigate, onNew, onCapture, onSearch, onCreateNotebook, onRenameNotebook, onShareNotebook, onDeleteNotebook, onAccount }: Props) {
   const [notebookMenu, setNotebookMenu] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notebookMenu) return;
+    const outside = (event: MouseEvent) => {
+      const row = (event.target as Element | null)?.closest('[data-notebook-id]');
+      if (row?.getAttribute('data-notebook-id') !== notebookMenu) setNotebookMenu(null);
+    };
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setNotebookMenu(null); };
+    document.addEventListener('mousedown', outside); document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', escape); };
+  }, [notebookMenu]);
   const navigate = (next: View) => { setNotebookMenu(null); onNavigate(next); onClose(); };
   return <>
     {open && <button className="sidebar-scrim mobile-only" aria-label="Close navigation" onClick={onClose} />}
@@ -52,7 +62,7 @@ export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavi
         </nav>
         <div className="sidebar-heading"><span>Notebooks</span><button onClick={onCreateNotebook} title="New notebook" aria-label="New notebook"><Plus size={14} /></button></div>
         <nav className="nav-group" aria-label="Notebooks">
-          {notebooks.map((notebook) => <div className="notebook-row" key={notebook.id}>
+          {notebooks.map((notebook) => <div className="notebook-row" data-notebook-id={notebook.id} key={notebook.id}>
             <button className={`nav-item ${view.kind === 'notebook' && view.id === notebook.id ? 'active' : ''}`} onClick={() => navigate({ kind: 'notebook', id: notebook.id })}><Folder size={16} /><span className="label">{notebook.name}</span><span className="nav-count">{counts.notebooks[notebook.id] || ''}</span></button>
             <div className="notebook-popover-wrap"><button className="icon-button notebook-menu-button" aria-label={`Actions for ${notebook.name}`} aria-expanded={notebookMenu === notebook.id} onClick={() => setNotebookMenu(notebookMenu === notebook.id ? null : notebook.id)}><MoreHorizontal size={15} /></button>
               {notebookMenu === notebook.id && <div className="small-menu notebook-menu" role="menu">
@@ -72,7 +82,7 @@ export function Sidebar({ view, notebooks, counts, online, open, onClose, onNavi
       <div className="sidebar-footer">
         <button className="nav-item" onClick={onAccount}><UserRound size={16} /><span className="label">Account &amp; sync</span></button>
         <button className={`nav-item ${view.kind === 'settings' ? 'active' : ''}`} onClick={() => navigate({ kind: 'settings' })}><Settings2 size={16} /><span className="label">Settings</span></button>
-        <div className="connection-line"><span className={`status-dot ${online ? '' : 'offline'}`} />{online ? 'Available offline' : 'Offline · changes stay here'}</div>
+        <div className="connection-line"><span className={`status-dot ${online ? '' : 'offline'}`} />{online ? 'Stored on this device' : 'Offline · changes stay here'}</div>
       </div>
     </aside>
   </>;
