@@ -158,7 +158,8 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, locked, tran
   }), [effectiveNotes, jot.notebooks]);
   const selected = effectiveNotes.find((note) => note.id === selectedId) || null;
   const persistedSelected = jot.notes.find((note) => note.id === selectedId) || null;
-  const recoveryAvailable = !!jot.workspaceId && persistedSelected?.role === 'viewer' && persistedSelected.syncState === 'local';
+  const selectedEntry = selectedId ? drafts.entries[selectedId] : undefined;
+  const recoveryAvailable = !!jot.workspaceId && persistedSelected?.role === 'viewer' && (persistedSelected.syncState === 'local' || (!!selectedEntry && selectedEntry.status !== 'saved'));
   const selectedDraft = selected ? drafts.get(selected) : null;
   const listTitle = view.kind === 'inbox' ? 'Inbox' : view.kind === 'starred' ? 'Pinned' : view.kind === 'notebook' ? (jot.notebooks.find((notebook) => notebook.id === view.id)?.name || 'Notebook') : 'All notes';
 
@@ -256,16 +257,20 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, locked, tran
   });
   const copyUnavailable = async () => runOperation(async () => {
     if (!persistedSelected || !recoveryAvailable) throw new Error('This note no longer needs recovery.');
-    const currentDraft = drafts.get(persistedSelected);
-    if (currentDraft.status === 'dirty' || currentDraft.status === 'saving') await drafts.save(persistedSelected.id);
-    const source = await jot.getNote(persistedSelected.id);
-    if (!source || source.role !== 'viewer' || source.syncState !== 'local') throw new Error('The note changed. Refresh and review it before copying.');
-    const visible = drafts.get(source).note;
-    const copy = await jot.copyUnavailableNoteToInbox(source.id, source.revision, { title: visible.title, body: visible.body, tags: visible.tags, pinned: visible.pinned });
-    // The visible draft now lives in the new copy; leave the original as its saved read-only record.
-    drafts.acceptPersisted(source); jot.clearError();
-    await jot.refresh();
-    setView({ kind: 'all' }); setSelectedId(copy.id); setMobileNoteOpen(true);
+    const id = persistedSelected.id;
+    try {
+      // Pause the forbidden original write; do not require it to save before copying.
+      const reviewed = await drafts.prepareRecovery(persistedSelected);
+      const source = await jot.getNote(id);
+      if (!source || source.role !== 'viewer') throw new Error('The note changed. Refresh and review it before copying.');
+      const visible = reviewed.note;
+      const copy = await jot.copyUnavailableNoteToInbox(source.id, source.revision, { title: visible.title, body: visible.body, tags: visible.tags, pinned: visible.pinned });
+      const accepted = drafts.finishRecovery(source, reviewed.sequence);
+      await jot.refresh();
+      if (!accepted) throw new Error('A copy was created, but newer edits remain in this draft. Review them and make another copy if needed.');
+      jot.clearError();
+      setView({ kind: 'all' }); setSelectedId(copy.id); setMobileNoteOpen(true);
+    } finally { drafts.cancelRecovery(id); }
   });
   const closeCapture = () => {
     if (captureProgress.current) {
@@ -290,13 +295,13 @@ function JotWorkspace({ jot, drafts, uiLocked, workspaceGeneration, locked, tran
     <Sidebar view={view} notebooks={jot.notebooks} counts={counts} online={online} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(next) => { setView(next); setMobileNoteOpen(false); }} onNew={newNote} onCapture={() => { captureProgress.current = null; captureReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setCaptureOpen(true); setSidebarOpen(false); }} onSearch={() => { setSearchOpen(true); setSidebarOpen(false); }} onCreateNotebook={() => setNotebookDialog({ mode: 'create' })} onRenameNotebook={(notebook) => setNotebookDialog({ mode: 'rename', notebook })} onShareNotebook={(notebook) => setShareTarget({ noteId: null, notebookId: notebook.id })} onDeleteNotebook={(notebook) => setNotebookDialog({ mode: 'delete', notebook })} onAccount={() => setAccountOpen(true)} />
     {listView ? <>
       <NoteList title={listTitle} notes={filteredNotes} notebooks={jot.notebooks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); setMobileNoteOpen(true); }} onNew={newNote} onSearch={() => setSearchOpen(true)} onOpenSidebar={() => setSidebarOpen(true)} />
-      {selectedDraft ? <NoteEditor draft={selectedDraft} busy={editorBusy} forceReadOnly={persistedSelected?.role === 'viewer'} recoveryAvailable={recoveryAvailable} onCopyUnavailable={copyUnavailable} notes={effectiveNotes} notebooks={jot.notebooks} onChange={(patch) => { if (!editorActionLock.current && !uiLocked.current && persistedSelected?.role !== 'viewer') drafts.change(selectedDraft.note, patch); }} onOpenNote={openNote} onBack={() => setMobileNoteOpen(false)} onOpenSidebar={() => setSidebarOpen(true)} onTrash={() => { void trashSelected(); }} onShare={() => { void runOperation(async () => { const saved = drafts.entries[selectedDraft.note.id] ? await drafts.save(selectedDraft.note.id) : selectedDraft.note; if (!saved) throw new Error('Resolve the unsaved changes before sharing this note.'); setShareTarget({ noteId: saved.id, notebookId: saved.notebookId }); }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not prepare this note for sharing.')); }} onComments={() => setCommentsOpen(true)} onKeepMine={() => { if (!uiLocked.current) void drafts.keepMine(selectedDraft.note.id); }} onUseLatest={() => { if (!uiLocked.current) drafts.useLatest(selectedDraft.note.id); }} onRetry={() => { if (!uiLocked.current) void drafts.retry(selectedDraft.note.id); }} listAttachments={jot.listAttachments} addAttachment={(noteId, file, name) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.addAttachment(noteId, file, name); })} deleteAttachment={(id) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.deleteAttachment(id); })} onAppendText={async (text) => runOperation(async () => {
+      {selectedDraft ? <NoteEditor draft={selectedDraft} busy={editorBusy} forceReadOnly={persistedSelected?.role === 'viewer'} recoveryAvailable={recoveryAvailable} recoveryUnavailable={persistedSelected?.syncState === 'local'} onCopyUnavailable={copyUnavailable} notes={effectiveNotes} notebooks={jot.notebooks} onChange={(patch) => { if (!editorActionLock.current && !uiLocked.current && persistedSelected?.role !== 'viewer') drafts.change(selectedDraft.note, patch); }} onOpenNote={openNote} onBack={() => setMobileNoteOpen(false)} onOpenSidebar={() => setSidebarOpen(true)} onTrash={() => { void trashSelected(); }} onShare={() => { void runOperation(async () => { const saved = drafts.entries[selectedDraft.note.id] ? await drafts.save(selectedDraft.note.id) : selectedDraft.note; if (!saved) throw new Error('Resolve the unsaved changes before sharing this note.'); setShareTarget({ noteId: saved.id, notebookId: saved.notebookId }); }).catch((error) => setNotice(error instanceof Error ? error.message : 'Could not prepare this note for sharing.')); }} onComments={() => setCommentsOpen(true)} onKeepMine={() => { if (!uiLocked.current) void drafts.keepMine(selectedDraft.note.id); }} onUseLatest={() => { if (!uiLocked.current) drafts.useLatest(selectedDraft.note.id); }} onRetry={() => { if (!uiLocked.current) void drafts.retry(selectedDraft.note.id); }} listAttachments={jot.listAttachments} addAttachment={(noteId, file, name) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.addAttachment(noteId, file, name); })} deleteAttachment={(id) => runOperation(() => { if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed. Please reopen the note.'); return jot.deleteAttachment(id); })} onAppendText={async (text) => runOperation(async () => {
         if (workspaceGeneration.current !== generationAtRender) throw new Error('The workspace changed before extraction finished. Please try again.');
         const current = drafts.get(selectedDraft.note).note;
         if (current.body.length + text.length > 1_000_000) throw new Error('This note would exceed the 1,000,000-character limit. Keep the attachment or shorten the note before extracting text.');
         drafts.change(current, { body: current.body + text });
         const saved = await drafts.save(current.id);
-        if (!saved) throw new Error('The extracted text is still in your draft. Resolve the save issue before continuing.');
+        return { saved: !!saved };
       })} /> : <main className="editor"><div className="empty-editor"><div><div className="empty-editor-icon"><FileText size={19} /></div><h2>{jot.isLoading ? 'Opening your notes…' : 'A little space to think.'}</h2><p>{jot.isLoading ? 'Your workspace is being prepared.' : 'Choose a note from the list, or start with a blank page.'}</p>{!jot.isLoading && <button className="button" style={{ marginTop: 18 }} onClick={newNote}><Plus size={14} /> New note</button>}</div></div></main>}
     </> : <WorkspaceViews view={view} notes={effectiveNotes} deletedNotes={deletedNotes} theme={theme} onTheme={setTheme} onOpenSidebar={() => setSidebarOpen(true)} onOpenNote={openNote} onToggleTask={toggleTask} onReviewed={reviewed} onCreateRecurring={createRecurring} onCreate={createNote} onRestore={(note) => runOperation(async () => { await jot.restoreNote(note.id, note.revision); await jot.refresh(); setDeletedNotes((items) => items.filter((item) => item.id !== note.id)); })} onExport={(password) => runTransfer(() => jot.exportBackup(password))} onExportMarkdown={() => runTransfer(() => jot.exportMarkdownZip())} onImport={(file, password) => runTransfer(async () => { await jot.importBackup(file, password); await jot.refresh(); })} onAccount={() => setAccountOpen(true)} />}
     {(notice || jot.error) && <div className="app-notice" role="alert"><span>{notice || jot.error}</span><button className="icon-button" onClick={() => { setNotice(null); jot.clearError(); }} aria-label="Dismiss"><X size={15} /></button></div>}

@@ -18,6 +18,7 @@ type Props = {
   busy?: boolean;
   forceReadOnly?: boolean;
   recoveryAvailable?: boolean;
+  recoveryUnavailable?: boolean;
   onCopyUnavailable: () => Promise<void>;
   notes: Note[];
   notebooks: Notebook[];
@@ -34,7 +35,7 @@ type Props = {
   listAttachments: (noteId: string) => Promise<Attachment[]>;
   addAttachment: (noteId: string, file: Blob, name: string) => Promise<Attachment>;
   deleteAttachment: (id: string) => Promise<void>;
-  onAppendText: (text: string) => Promise<void>;
+  onAppendText: (text: string) => Promise<{ saved: boolean } | void>;
 };
 
 const shortDate = (value: string) => new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
@@ -53,7 +54,7 @@ function renderWikiLinks(body: string) {
   }).join('');
 }
 
-export function NoteEditor({ draft, busy = false, forceReadOnly = false, recoveryAvailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText }: Props) {
+export function NoteEditor({ draft, busy = false, forceReadOnly = false, recoveryAvailable = false, recoveryUnavailable = false, onCopyUnavailable, notes, notebooks, onChange, onOpenNote, onBack, onOpenSidebar, onTrash, onShare, onComments, onKeepMine, onUseLatest, onRetry, listAttachments, addAttachment, deleteAttachment, onAppendText }: Props) {
   const note = draft.note;
   const viewer = forceReadOnly || note.role === 'viewer';
   const readOnly = viewer || busy;
@@ -186,7 +187,7 @@ export function NoteEditor({ draft, busy = false, forceReadOnly = false, recover
               <div className="notice-actions">{draft.status === 'conflict' ? conflictChoice ? <><button className="button" onClick={() => { if (conflictChoice === 'mine') onKeepMine(); else onUseLatest(); }}>{conflictChoice === 'mine' ? 'Confirm overwrite' : 'Confirm discard'}</button><button className="button ghost" onClick={() => setConflictChoice(null)}>Cancel</button></> : <><button className="button" onClick={() => setConflictChoice('mine')}>Keep my draft</button><button className="button ghost" onClick={() => setConflictChoice('latest')}>Use latest version</button></> : <button className="button" onClick={onRetry}>Retry save</button>}</div>
             </div>
           </div>}
-          {recoveryAvailable ? <div className="notice editor-notice recovery-notice"><CircleAlert size={15} /><div><strong>This shared note is no longer available</strong>Your local version and any visible draft are still here. You can make a personal copy, including its local files.
+          {recoveryAvailable ? <div className="notice editor-notice recovery-notice"><CircleAlert size={15} /><div><strong>{recoveryUnavailable ? 'This shared note is no longer available' : 'Your editing access changed'}</strong>Your local version and any visible draft are still here. You can make a personal copy, including its local files.
             {recoverConfirm ? <><p className="conflict-confirm">The new copy will be in your Inbox and queued to sync to this account. Reconnect and sign in if needed. The original stays read-only.</p><div className="notice-actions"><button className="button" disabled={recoverBusy} onClick={() => { setRecoverBusy(true); setRecoverError(''); void onCopyUnavailable().catch((error) => setRecoverError(error instanceof Error ? error.message : 'Could not make a copy.')).finally(() => setRecoverBusy(false)); }}>{recoverBusy ? 'Copying…' : 'Confirm personal copy'}</button><button className="button ghost" disabled={recoverBusy} onClick={() => setRecoverConfirm(false)}>Cancel</button></div></> : <div className="notice-actions"><button className="button" onClick={() => setRecoverConfirm(true)}>Make personal copy</button></div>}
             {recoverError && <p className="dialog-error" role="alert">{recoverError}</p>}</div></div> : viewer && <div className="notice editor-notice"><Eye size={15} /><span>You have view-only access to this note.</span></div>}
           <input ref={titleRef} aria-label="Note title" className="note-title-input" value={note.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="Untitled note" maxLength={300} readOnly={readOnly} />
