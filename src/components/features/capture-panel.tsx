@@ -301,6 +301,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
         let url: URL;
         try { url = new URL(webUrl.trim()); } catch { throw new Error("Enter a valid web address including https://."); }
         if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Use an http:// or https:// web address.");
+        if (url.username || url.password) throw new Error("For your privacy, remove the username and password from the web address before saving.");
         sections.push(`### Saved link\n\n[${url.hostname.replace(/[\[\]]/g, "")}](<${url.href.replace(/>/g, "%3E")}>)`);
       }
       if (html.trim()) {
@@ -310,9 +311,11 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
       }
       if (transcript.trim()) sections.push(`### Live transcript\n\n${escapeImportedText(transcript.trim())}`);
       for (const item of files) if (item.extracted) sections.push(`### Extracted from ${escapeImportedText(cleanName(item.file.name))}\n\n${escapeImportedText(item.extracted)}`);
+      const noteBody = sections.filter(Boolean).join("\n\n");
+      if (noteBody.length > 1_000_000) throw new Error("This note exceeds the 1,000,000-character limit. Shorten it or choose ‘Keep file only’ for an extracted attachment.");
       setBusy(true);
       attemptedSave = true;
-      await onCreate({ title: title.trim() || "Untitled", body: sections.filter(Boolean).join("\n\n") }, files.map((item) => item.file));
+      await onCreate({ title: title.trim() || "Untitled", body: noteBody }, files.map((item) => item.file));
       onClose();
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Couldn’t save this capture. Please try again.";
@@ -334,7 +337,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
         <fieldset className={styles.fields} disabled={busy}>
         {error && <p className={styles.error} role="alert">{error}</p>}
         {notice && <p className={styles.copy} role="status" style={{ marginBottom: 12 }}>{notice}</p>}
-        <div className={styles.field}><label className={styles.fieldLabel} htmlFor="capture-title">Title</label><input id="capture-title" className={styles.title} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Give this a name…" autoFocus /></div>
+        <div className={styles.field}><label className={styles.fieldLabel} htmlFor="capture-title">Title</label><input id="capture-title" className={styles.title} value={title} onChange={(event) => setTitle(event.target.value)} maxLength={300} placeholder="Give this a name…" autoFocus /></div>
         <div className={styles.field}><label className={styles.fieldLabel} htmlFor="capture-body">Note <span style={{ fontWeight: 400 }}>(optional)</span></label><textarea id="capture-body" className={styles.body} value={body} onChange={(event) => setBody(event.target.value)} placeholder="A thought, a link, a little detail…" /></div>
         <div className={styles.tabs} role="tablist" aria-label="Capture format">
           {([{ id: "file", label: "Files", Icon: Paperclip }, { id: "voice", label: "Voice", Icon: Mic }, { id: "web", label: "Web", Icon: Link2 }, { id: "sketch", label: "Sketch", Icon: PenLine }] as const).map(({ id, label, Icon }) => <button key={id} type="button" role="tab" aria-selected={mode === id} className={styles.tab} disabled={locked && mode !== id} onClick={() => setMode(id)}><Icon size={14} />{label}</button>)}
@@ -371,7 +374,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
         </div>
         {files.length > 0 && <div className={styles.fileList} aria-label="Files to attach">{files.map((item) => {
           const Icon = isImage(item.file) ? FileImage : isAudio(item.file) ? FileAudio : FileText;
-          return <div className={styles.fileRow} key={item.id}><Icon className={styles.fileIcon} size={16} /><div className={styles.fileInfo}><div className={styles.fileName} title={item.file.name}>{fileLabel(item.file)}</div><div className={styles.fileStatus} aria-live="polite">{item.message}</div></div><div className={styles.fileActions}>{item.state === "working" ? <button type="button" className={styles.textButton} onClick={() => cancelExtraction(item.id)}>Stop</button> : isImage(item.file) && item.state !== "done" ? <button type="button" className={styles.textButton} onClick={() => void runExtraction(item, "image")}>Make searchable</button> : null}<button type="button" className={styles.remove} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button></div></div>;
+          return <div className={styles.fileRow} key={item.id}><Icon className={styles.fileIcon} size={16} /><div className={styles.fileInfo}><div className={styles.fileName} title={item.file.name}>{fileLabel(item.file)}</div><div className={styles.fileStatus} aria-live="polite">{item.message}</div></div><div className={styles.fileActions}>{item.state === "working" ? <button type="button" className={styles.textButton} onClick={() => cancelExtraction(item.id)}>Stop</button> : item.state === "done" ? <button type="button" className={styles.textButton} onClick={() => updateFile(item.id, { state: "ready", message: "Extracted text removed; the file will still be attached.", extracted: "" })}>Keep file only</button> : (isImage(item.file) || isPdf(item.file)) ? <button type="button" className={styles.textButton} onClick={() => void runExtraction(item, isPdf(item.file) ? "pdf" : "image")}>Make searchable</button> : null}<button type="button" className={styles.remove} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button></div></div>;
         })}</div>}
         </fieldset>
       </div>
