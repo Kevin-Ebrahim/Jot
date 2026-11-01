@@ -212,3 +212,79 @@ test('HTTP routes enforce session, CSRF, origin and server-side permissions', as
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('attachment sync is ACL-scoped, immutable, bounded and tombstoned', async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'jot-attachments-'));
+  process.env.JOT_DATA_DIR = directory;
+  const origin = 'http://localhost:3000';
+  const registerRoute = await import('../src/app/api/auth/register/route');
+  const noteRoute = await import('../src/app/api/notes/[id]/route');
+  const shareRoute = await import('../src/app/api/notes/[id]/shares/route');
+  const listRoute = await import('../src/app/api/notes/[id]/attachments/route');
+  const itemRoute = await import('../src/app/api/notes/[id]/attachments/[attachmentId]/route');
+  function jsonReq(url: string, method: string, body: unknown, cookie?: string, csrf?: string): Request {
+    return new Request(origin + url, { method, headers: { origin, 'content-type': 'application/json', ...(cookie ? { cookie } : {}), ...(csrf ? { 'x-csrf-token': csrf } : {}) }, body: JSON.stringify(body) });
+  }
+  async function account(email: string) {
+    const res = await registerRoute.POST(jsonReq('/api/auth/register', 'POST', { email, password: 'another strong password' }));
+    assert.equal(res.status, 201);
+    const { user, csrfToken } = await res.json();
+    return { user, csrfToken, cookie: res.headers.get('set-cookie')!.split(';')[0] };
+  }
+  try {
+    const alice = await account('attachments-owner@example.test');
+    const bob = await account('attachments-viewer@example.test');
+    const stranger = await account('attachments-stranger@example.test');
+    const item = note();
+    const noteCtx = { params: Promise.resolve({ id: item.id }) };
+    await noteRoute.PUT(jsonReq(`/api/notes/${item.id}`, 'PUT', { baseVersion: 0, operationId: randomUUID(), note: item }, alice.cookie, alice.csrfToken), noteCtx);
+    await shareRoute.POST(jsonReq(`/api/notes/${item.id}/shares`, 'POST', { email: bob.user.email, role: 'viewer' }, alice.cookie, alice.csrfToken), noteCtx);
+    const attachmentId = randomUUID();
+    const attachmentCtx = { params: Promise.resolve({ id: item.id, attachmentId }) };
+    const endpoint = `${origin}/api/notes/${item.id}/attachments/${attachmentId}`;
+    const bytes = new TextEncoder().encode('<script>alert(1)</script>');
+    function upload(who: typeof alice, data = bytes, foreignOrigin = origin): Request {
+      return new Request(endpoint, { method: 'PUT', headers: { origin: foreignOrigin, cookie: who.cookie, 'x-csrf-token': who.csrfToken,
+        'x-jot-filename': encodeURIComponent('../../test.html'), 'x-jot-created-at': now, 'content-type': 'text/html' }, body: Uint8Array.from(data) });
+    }
+    assert.equal((await itemRoute.PUT(upload(alice, bytes, 'https://evil.example'), attachmentCtx)).status, 403);
+    assert.equal((await itemRoute.PUT(upload(bob), attachmentCtx)).status, 403);
+    assert.equal((await itemRoute.PUT(upload(stranger), attachmentCtx)).status, 404);
+    const uploaded = await itemRoute.PUT(upload(alice), attachmentCtx);
+    assert.equal(uploaded.status, 200);
+    const metadata = (await uploaded.json()).attachment;
+    assert.equal(metadata.name, '.._.._test.html');
+    assert.equal(metadata.mimeType, 'text/html');
+    assert.equal(metadata.size, bytes.length);
+    assert.equal((await itemRoute.PUT(upload(alice), attachmentCtx)).status, 200);
+    assert.equal((await itemRoute.PUT(upload(alice, new TextEncoder().encode('other')), attachmentCtx)).status, 409);
+    const list = await listRoute.GET(new Request(`${origin}/api/notes/${item.id}/attachments`, { headers: { cookie: bob.cookie } }), noteCtx);
+    assert.equal((await list.json()).attachments[0].id, attachmentId);
+    const download = await itemRoute.GET(new Request(endpoint, { headers: { cookie: bob.cookie } }), attachmentCtx);
+    assert.equal(download.status, 200);
+    assert.equal(download.headers.get('content-type'), 'application/octet-stream');
+    assert.match(download.headers.get('content-disposition')!, /^attachment;/);
+    assert.equal(download.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(download.headers.get('content-security-policy')!, /sandbox/);
+    assert.deepEqual(new Uint8Array(await download.arrayBuffer()), bytes);
+    assert.equal((await itemRoute.GET(new Request(endpoint, { headers: { cookie: stranger.cookie } }), attachmentCtx)).status, 404);
+    const remove = () => new Request(endpoint, { method: 'DELETE', headers: { origin, cookie: alice.cookie, 'x-csrf-token': alice.csrfToken } });
+    const deleted = (await (await itemRoute.DELETE(remove(), attachmentCtx)).json()).attachment;
+    assert.ok(deleted.deletedAt);
+    assert.deepEqual((await (await itemRoute.DELETE(remove(), attachmentCtx)).json()).attachment, deleted);
+    assert.equal((await itemRoute.GET(new Request(endpoint, { headers: { cookie: bob.cookie } }), attachmentCtx)).status, 404);
+    assert.equal((await itemRoute.PUT(upload(alice), attachmentCtx)).status, 409);
+    assert.equal((await (await listRoute.GET(new Request(`${origin}/api/notes/${item.id}/attachments`, { headers: { cookie: bob.cookie } }), noteCtx)).json()).attachments[0].deletedAt, deleted.deletedAt);
+    const bigCtx = { params: Promise.resolve({ id: item.id, attachmentId: randomUUID() }) };
+    const big = new Uint8Array(10 * 1024 * 1024 + 1);
+    assert.equal((await itemRoute.PUT(upload(alice, big), bigCtx)).status, 413);
+    process.env.JOT_MAX_USER_STORAGE_BYTES = '2';
+    const quotaCtx = { params: Promise.resolve({ id: item.id, attachmentId: randomUUID() }) };
+    assert.equal((await itemRoute.PUT(upload(alice), quotaCtx)).status, 413);
+  } finally {
+    const holder = globalThis as typeof globalThis & { __jotDatabase?: DatabaseSync };
+    holder.__jotDatabase?.close(); delete holder.__jotDatabase;
+    delete process.env.JOT_DATA_DIR; delete process.env.JOT_MAX_USER_STORAGE_BYTES;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

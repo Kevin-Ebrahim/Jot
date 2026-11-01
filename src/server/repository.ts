@@ -12,6 +12,11 @@ interface Receipt { target: string; payload_hash: string; response_json: string 
 export interface Envelope<T> { note?: T; notebook?: T; version: number; role: Role }
 export interface Share { user: PublicUser; role: ShareRole }
 export interface Comment { id: string; noteId: string; author: PublicUser; body: string; createdAt: string; updatedAt: string }
+export interface AttachmentMetadata { id: string; noteId: string; name: string; mimeType: string; size: number; createdAt: string; deletedAt: string | null }
+interface AttachmentRow { id: string; note_id: string; name: string; mime_type: string; size: number; created_at: string; deleted_at: string | null; sha256: string; data: Uint8Array | null }
+function attachmentMetadata(row: AttachmentRow): AttachmentMetadata {
+  return { id: row.id, noteId: row.note_id, name: row.name, mimeType: row.mime_type, size: row.size, createdAt: row.created_at, deletedAt: row.deleted_at };
+}
 
 type Kind = 'note' | 'notebook';
 function transaction<T>(db: DatabaseSync, fn: () => T): T {
@@ -219,5 +224,63 @@ export class Repository {
     if (!comment) throw new HttpError(404, 'Comment not found');
     if (comment.author_id !== userId && note.role !== 'owner') throw new HttpError(403, 'Only the author or note owner can delete this comment');
     this.db.prepare('DELETE FROM comments WHERE id = ?').run(commentId);
+  }
+  /** Authorize both before reading a body and inside the final write transaction. */
+  requireAttachmentAccess(userId: string, noteId: string, write = false): void {
+    const note = this.noteRow(userId, noteId);
+    if (!note) throw new HttpError(404, 'Note not found');
+    if (write && note.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+  }
+  listAttachments(userId: string, noteId: string): AttachmentMetadata[] {
+    this.requireAttachmentAccess(userId, noteId);
+    const rows = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at FROM attachments WHERE note_id = ? ORDER BY created_at, id')
+      .all(noteId) as unknown as AttachmentRow[];
+    return rows.map(attachmentMetadata);
+  }
+  putAttachment(userId: string, noteId: string, attachmentId: string, name: string, mimeType: string, createdAt: string, data: Uint8Array): AttachmentMetadata {
+    const sha = createHash('sha256').update(data).digest('hex');
+    return transaction(this.db, () => {
+      this.requireAttachmentAccess(userId, noteId, true);
+      const existing = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at, sha256 FROM attachments WHERE id = ?')
+        .get(attachmentId) as unknown as AttachmentRow | undefined;
+      if (existing) {
+        if (existing.note_id !== noteId) throw new HttpError(404, 'Attachment not found');
+        if (existing.deleted_at) throw new HttpError(409, 'A deleted attachment cannot be recreated');
+        if (existing.sha256 !== sha || existing.size !== data.byteLength || existing.name !== name || existing.mime_type !== mimeType || existing.created_at !== createdAt) {
+          throw new HttpError(409, 'Attachment id was already used with different content');
+        }
+        return attachmentMetadata(existing);
+      }
+      const owner = this.db.prepare('SELECT owner_id FROM notes WHERE id = ?').get(noteId) as unknown as { owner_id: string };
+      const total = this.db.prepare(`SELECT COALESCE(SUM(a.size), 0) AS total FROM attachments a
+        JOIN notes n ON n.id = a.note_id WHERE n.owner_id = ? AND a.deleted_at IS NULL`).get(owner.owner_id) as unknown as { total: number };
+      const configuredLimit = process.env.JOT_MAX_USER_STORAGE_BYTES;
+      const quota = configuredLimit === undefined ? 1024 * 1024 * 1024 : Number(configuredLimit);
+      if (!Number.isSafeInteger(quota) || quota < 0) throw new HttpError(500, 'Invalid storage quota configuration');
+      if (total.total + data.byteLength > quota) throw new HttpError(413, 'Attachment storage quota exceeded');
+      this.db.prepare('INSERT INTO attachments (id, note_id, name, mime_type, size, created_at, deleted_at, sha256, data) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)')
+        .run(attachmentId, noteId, name, mimeType, data.byteLength, createdAt, sha, data);
+      return { id: attachmentId, noteId, name, mimeType, size: data.byteLength, createdAt, deletedAt: null };
+    });
+  }
+  getAttachment(userId: string, noteId: string, attachmentId: string): { metadata: AttachmentMetadata; data: Uint8Array } {
+    this.requireAttachmentAccess(userId, noteId);
+    const row = this.db.prepare('SELECT * FROM attachments WHERE id = ? AND note_id = ?').get(attachmentId, noteId) as unknown as AttachmentRow | undefined;
+    if (!row || row.deleted_at || !row.data) throw new HttpError(404, 'Attachment not found');
+    return { metadata: attachmentMetadata(row), data: row.data };
+  }
+  deleteAttachment(userId: string, noteId: string, attachmentId: string): AttachmentMetadata {
+    return transaction(this.db, () => {
+      this.requireAttachmentAccess(userId, noteId, true);
+      const row = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at FROM attachments WHERE id = ? AND note_id = ?')
+        .get(attachmentId, noteId) as unknown as AttachmentRow | undefined;
+      if (!row) throw new HttpError(404, 'Attachment not found');
+      if (!row.deleted_at) {
+        row.deleted_at = new Date().toISOString();
+        // Keep a permanent tombstone but discard the remote bytes to reclaim space.
+        this.db.prepare('UPDATE attachments SET deleted_at = ?, data = NULL WHERE id = ?').run(row.deleted_at, attachmentId);
+      }
+      return attachmentMetadata(row);
+    });
   }
 }

@@ -34,7 +34,7 @@ export function text(value: unknown, label: string, max: number, allowEmpty = tr
   if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value.trim())) fail(`Invalid ${label}`);
   return value as string;
 }
-function date(value: unknown, label: string): string {
+export function date(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length > 32 || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) || !Number.isFinite(Date.parse(value))) fail(`Invalid ${label}`);
   return value as string;
 }

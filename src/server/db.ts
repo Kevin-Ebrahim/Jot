@@ -69,6 +69,18 @@ export function openDatabase(filename: string): DatabaseSync {
       updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS comments_note ON comments(note_id, created_at);
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      deleted_at TEXT,
+      sha256 TEXT NOT NULL,
+      data BLOB
+    );
+    CREATE INDEX IF NOT EXISTS attachments_note ON attachments(note_id);
     CREATE TABLE IF NOT EXISTS operations (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       operation_id TEXT NOT NULL,
