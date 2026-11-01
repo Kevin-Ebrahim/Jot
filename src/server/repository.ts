@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './errors';
 import type { PublicUser } from './auth';
 import type { Role, ServerNote, ServerNotebook, ShareRole } from './validation';
+import { cipherFor, type ContentCipher } from './content-crypto';
 
 interface RecordRow { id: string; owner_id: string; version: number; data_json: string; deleted_at: string | null }
 interface NoteRow extends RecordRow { notebook_id: string | null }
@@ -14,8 +15,8 @@ export interface Share { user: PublicUser; role: ShareRole }
 export interface Comment { id: string; noteId: string; author: PublicUser; body: string; createdAt: string; updatedAt: string }
 export interface AttachmentMetadata { id: string; noteId: string; name: string; mimeType: string; size: number; createdAt: string; deletedAt: string | null }
 interface AttachmentRow { id: string; note_id: string; name: string; mime_type: string; size: number; created_at: string; deleted_at: string | null; sha256: string; data: Uint8Array | null }
-function attachmentMetadata(row: AttachmentRow): AttachmentMetadata {
-  return { id: row.id, noteId: row.note_id, name: row.name, mimeType: row.mime_type, size: row.size, createdAt: row.created_at, deletedAt: row.deleted_at };
+function attachmentMetadata(row: AttachmentRow, cipher: ContentCipher): AttachmentMetadata {
+  return { id: row.id, noteId: row.note_id, name: cipher.openText(row.name, `attachment-name:${row.id}`), mimeType: row.mime_type, size: row.size, createdAt: row.created_at, deletedAt: row.deleted_at };
 }
 
 type Kind = 'note' | 'notebook';
@@ -24,7 +25,6 @@ function transaction<T>(db: DatabaseSync, fn: () => T): T {
   try { const result = fn(); db.exec('COMMIT'); return result; }
   catch (error) { db.exec('ROLLBACK'); throw error; }
 }
-function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_RECEIPTS_PER_ACCOUNT = 10_000;
 function receipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string): number | null {
@@ -47,11 +47,17 @@ function saveReceipt(db: DatabaseSync, userId: string, operationId: string, targ
     SELECT operation_id FROM operations WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
   )`).run(userId, userId, MAX_RECEIPTS_PER_ACCOUNT);
 }
-function noteEnvelope(row: NoteRoleRow): { note: ServerNote; version: number; role: Role } {
-  return { note: JSON.parse(row.data_json) as ServerNote, version: row.version, role: row.role };
+function openNote(row: RecordRow, cipher: ContentCipher): ServerNote {
+  return JSON.parse(cipher.openText(row.data_json, `note:${row.id}`)) as ServerNote;
 }
-function notebookEnvelope(row: RoleRow): { notebook: ServerNotebook; version: number; role: Role } {
-  return { notebook: JSON.parse(row.data_json) as ServerNotebook, version: row.version, role: row.role };
+function openNotebook(row: RecordRow, cipher: ContentCipher): ServerNotebook {
+  return JSON.parse(cipher.openText(row.data_json, `notebook:${row.id}`)) as ServerNotebook;
+}
+function noteEnvelope(row: NoteRoleRow, cipher: ContentCipher): { note: ServerNote; version: number; role: Role } {
+  return { note: openNote(row, cipher), version: row.version, role: row.role };
+}
+function notebookEnvelope(row: RoleRow, cipher: ContentCipher): { notebook: ServerNotebook; version: number; role: Role } {
+  return { notebook: openNotebook(row, cipher), version: row.version, role: row.role };
 }
 
 // A notebook grant covers its notes; direct and inherited permissions combine
@@ -70,7 +76,8 @@ const notebookSelect = `SELECT b.*,
   FROM notebooks b LEFT JOIN notebook_shares shared ON shared.notebook_id = b.id AND shared.user_id = ?`;
 
 export class Repository {
-  constructor(private readonly db: DatabaseSync) {}
+  private readonly cipher: ContentCipher;
+  constructor(private readonly db: DatabaseSync) { this.cipher = cipherFor(db); }
   private noteRow(userId: string, noteId: string): NoteRoleRow | undefined {
     const row = this.db.prepare(`${noteSelect} WHERE n.id = ?`).get(userId, userId, userId, noteId) as unknown as NoteRoleRow | undefined;
     return row?.role ? row : undefined;
@@ -88,15 +95,15 @@ export class Repository {
   listNotes(userId: string): Array<{ note: ServerNote; version: number; role: Role }> {
     const rows = this.db.prepare(`${noteSelect} WHERE n.owner_id = ? OR direct.user_id IS NOT NULL OR inherited.user_id IS NOT NULL`)
       .all(userId, userId, userId, userId) as unknown as NoteRoleRow[];
-    return rows.map(noteEnvelope);
+    return rows.map((row) => noteEnvelope(row, this.cipher));
   }
   listNotebooks(userId: string): Array<{ notebook: ServerNotebook; version: number; role: Role }> {
     const rows = this.db.prepare(`${notebookSelect} WHERE b.owner_id = ? OR shared.user_id IS NOT NULL`)
       .all(userId, userId, userId) as unknown as RoleRow[];
-    return rows.map(notebookEnvelope);
+    return rows.map((row) => notebookEnvelope(row, this.cipher));
   }
   putNote(userId: string, operationId: string, baseVersion: number, input: ServerNote): { note: ServerNote; version: number; role: Role } {
-    const payloadHash = digest({ baseVersion, note: input });
+    const payloadHash = this.cipher.fingerprint(JSON.stringify({ baseVersion, note: input }));
     const target = `note:${input.id}`;
     return transaction(this.db, () => {
       const existing = this.db.prepare('SELECT * FROM notes WHERE id = ?').get(input.id) as unknown as NoteRow | undefined;
@@ -107,12 +114,12 @@ export class Repository {
         if (!current) throw new HttpError(404, 'Note not found');
         // A later edit makes the original response unavailable; a conflict is
         // safer than acknowledging the wrong version or retaining note bodies.
-        if (current.version !== prior) throw new HttpError(409, 'conflict', { serverVersion: current.version, serverNote: JSON.parse(current.data_json) });
-        return noteEnvelope(current);
+        if (current.version !== prior) throw new HttpError(409, 'conflict', { serverVersion: current.version, serverNote: openNote(current, this.cipher) });
+        return noteEnvelope(current, this.cipher);
       }
       if (current?.role === 'viewer') throw new HttpError(403, 'This note is read-only');
       if (existing && existing.version !== baseVersion) {
-        throw new HttpError(409, 'conflict', { serverVersion: existing.version, serverNote: JSON.parse(existing.data_json) });
+        throw new HttpError(409, 'conflict', { serverVersion: existing.version, serverNote: openNote(existing, this.cipher) });
       }
       if (!existing && baseVersion !== 0) throw new HttpError(409, 'Note does not exist');
       if (existing && current?.role !== 'owner' && existing.notebook_id !== input.notebookId) {
@@ -132,22 +139,23 @@ export class Repository {
         if (!existing) ownerId = notebook.owner_id;
       }
       const version = (existing?.version || 0) + 1;
+      const stored = this.cipher.sealText(JSON.stringify(input), `note:${input.id}`);
       if (existing) {
         this.db.prepare('UPDATE notes SET notebook_id = ?, version = ?, data_json = ?, deleted_at = ? WHERE id = ?')
-          .run(input.notebookId, version, JSON.stringify(input), input.deletedAt, input.id);
+          .run(input.notebookId, version, stored, input.deletedAt, input.id);
       } else {
         this.db.prepare('INSERT INTO notes (id, owner_id, notebook_id, version, data_json, deleted_at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(input.id, ownerId, input.notebookId, version, JSON.stringify(input), input.deletedAt);
+          .run(input.id, ownerId, input.notebookId, version, stored, input.deletedAt);
       }
       const updated = this.noteRow(userId, input.id);
       if (!updated) throw new HttpError(403, 'No access to note');
-      const response = noteEnvelope(updated);
+      const response = noteEnvelope(updated, this.cipher);
       saveReceipt(this.db, userId, operationId, target, payloadHash, response.version);
       return response;
     });
   }
   putNotebook(userId: string, operationId: string, baseVersion: number, input: ServerNotebook): { notebook: ServerNotebook; version: number; role: Role } {
-    const payloadHash = digest({ baseVersion, notebook: input });
+    const payloadHash = this.cipher.fingerprint(JSON.stringify({ baseVersion, notebook: input }));
     const target = `notebook:${input.id}`;
     return transaction(this.db, () => {
       const existing = this.db.prepare('SELECT * FROM notebooks WHERE id = ?').get(input.id) as unknown as RecordRow | undefined;
@@ -156,24 +164,25 @@ export class Repository {
       const prior = receipt(this.db, userId, operationId, target, payloadHash);
       if (prior !== null) {
         if (!current) throw new HttpError(404, 'Notebook not found');
-        if (current.version !== prior) throw new HttpError(409, 'conflict', { serverVersion: current.version, serverNotebook: JSON.parse(current.data_json) });
-        return notebookEnvelope(current);
+        if (current.version !== prior) throw new HttpError(409, 'conflict', { serverVersion: current.version, serverNotebook: openNotebook(current, this.cipher) });
+        return notebookEnvelope(current, this.cipher);
       }
       if (current?.role === 'viewer') throw new HttpError(403, 'This notebook is read-only');
       if (existing && existing.version !== baseVersion) {
-        throw new HttpError(409, 'conflict', { serverVersion: existing.version, serverNotebook: JSON.parse(existing.data_json) });
+        throw new HttpError(409, 'conflict', { serverVersion: existing.version, serverNotebook: openNotebook(existing, this.cipher) });
       }
       if (!existing && baseVersion !== 0) throw new HttpError(409, 'Notebook does not exist');
       if (existing && existing.deleted_at !== input.deletedAt && current?.role !== 'owner') {
         throw new HttpError(403, 'Only the owner can trash or restore a notebook');
       }
       const version = (existing?.version || 0) + 1;
+      const stored = this.cipher.sealText(JSON.stringify(input), `notebook:${input.id}`);
       if (existing) {
         this.db.prepare('UPDATE notebooks SET version = ?, data_json = ?, deleted_at = ? WHERE id = ?')
-          .run(version, JSON.stringify(input), input.deletedAt, input.id);
+          .run(version, stored, input.deletedAt, input.id);
       } else {
         this.db.prepare('INSERT INTO notebooks (id, owner_id, version, data_json, deleted_at) VALUES (?, ?, ?, ?, ?)')
-          .run(input.id, userId, version, JSON.stringify(input), input.deletedAt);
+          .run(input.id, userId, version, stored, input.deletedAt);
       }
       // A deleted notebook does not delete notes. Detach them atomically and
       // bump each note's version so stale offline changes conflict safely.
@@ -182,15 +191,15 @@ export class Repository {
         const update = this.db.prepare('UPDATE notes SET notebook_id = NULL, version = ?, data_json = ? WHERE id = ?');
         const now = new Date().toISOString();
         for (const item of notes) {
-          const note = JSON.parse(item.data_json) as ServerNote;
+          const note = openNote(item, this.cipher);
           note.notebookId = null;
           note.updatedAt = now;
-          update.run(item.version + 1, JSON.stringify(note), item.id);
+          update.run(item.version + 1, this.cipher.sealText(JSON.stringify(note), `note:${item.id}`), item.id);
         }
       }
       const updated = this.notebookRow(userId, input.id);
       if (!updated) throw new HttpError(403, 'No access to notebook');
-      const response = notebookEnvelope(updated);
+      const response = notebookEnvelope(updated, this.cipher);
       saveReceipt(this.db, userId, operationId, target, payloadHash, response.version);
       return response;
     });
@@ -223,7 +232,7 @@ export class Repository {
       FROM comments c JOIN users u ON u.id = c.author_id WHERE c.note_id = ? ORDER BY c.created_at, c.id`).all(noteId) as unknown as Array<{
         id: string; note_id: string; body: string; created_at: string; updated_at: string; author_id: string; author_email: string;
       }>;
-    return rows.map((row) => ({ id: row.id, noteId: row.note_id, author: { id: row.author_id, email: row.author_email }, body: row.body, createdAt: row.created_at, updatedAt: row.updated_at }));
+    return rows.map((row) => ({ id: row.id, noteId: row.note_id, author: { id: row.author_id, email: row.author_email }, body: this.cipher.openText(row.body, `comment:${row.id}`), createdAt: row.created_at, updatedAt: row.updated_at }));
   }
   addComment(user: PublicUser, noteId: string, body: string): Comment {
     const row = this.noteRow(user.id, noteId);
@@ -232,7 +241,7 @@ export class Repository {
     const now = new Date().toISOString();
     const comment = { id: randomUUID(), noteId, author: user, body, createdAt: now, updatedAt: now };
     this.db.prepare('INSERT INTO comments (id, note_id, author_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(comment.id, noteId, user.id, body, now, now);
+      .run(comment.id, noteId, user.id, this.cipher.sealText(body, `comment:${comment.id}`), now, now);
     return comment;
   }
   deleteComment(userId: string, noteId: string, commentId: string): void {
@@ -253,10 +262,10 @@ export class Repository {
     this.requireAttachmentAccess(userId, noteId);
     const rows = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at FROM attachments WHERE note_id = ? ORDER BY created_at, id')
       .all(noteId) as unknown as AttachmentRow[];
-    return rows.map(attachmentMetadata);
+    return rows.map((row) => attachmentMetadata(row, this.cipher));
   }
   putAttachment(userId: string, noteId: string, attachmentId: string, name: string, mimeType: string, createdAt: string, data: Uint8Array): AttachmentMetadata {
-    const sha = createHash('sha256').update(data).digest('hex');
+    const sha = this.cipher.fingerprint(data);
     return transaction(this.db, () => {
       this.requireAttachmentAccess(userId, noteId, true);
       const existing = this.db.prepare('SELECT id, note_id, name, mime_type, size, created_at, deleted_at, sha256 FROM attachments WHERE id = ?')
@@ -264,10 +273,10 @@ export class Repository {
       if (existing) {
         if (existing.note_id !== noteId) throw new HttpError(404, 'Attachment not found');
         if (existing.deleted_at) throw new HttpError(409, 'A deleted attachment cannot be recreated');
-        if (existing.sha256 !== sha || existing.size !== data.byteLength || existing.name !== name || existing.mime_type !== mimeType || existing.created_at !== createdAt) {
+        if (existing.sha256 !== sha || existing.size !== data.byteLength || this.cipher.openText(existing.name, `attachment-name:${existing.id}`) !== name || existing.mime_type !== mimeType || existing.created_at !== createdAt) {
           throw new HttpError(409, 'Attachment id was already used with different content');
         }
-        return attachmentMetadata(existing);
+        return attachmentMetadata(existing, this.cipher);
       }
       const owner = this.db.prepare('SELECT owner_id FROM notes WHERE id = ?').get(noteId) as unknown as { owner_id: string };
       const total = this.db.prepare(`SELECT COALESCE(SUM(a.size), 0) AS total FROM attachments a
@@ -283,7 +292,7 @@ export class Repository {
       if (total.total + data.byteLength > quota) throw new HttpError(413, 'Attachment storage quota exceeded');
       if (count.total >= recordQuota) throw new HttpError(413, 'Attachment record quota exceeded');
       this.db.prepare('INSERT INTO attachments (id, note_id, name, mime_type, size, created_at, deleted_at, sha256, data) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)')
-        .run(attachmentId, noteId, name, mimeType, data.byteLength, createdAt, sha, data);
+        .run(attachmentId, noteId, this.cipher.sealText(name, `attachment-name:${attachmentId}`), mimeType, data.byteLength, createdAt, sha, this.cipher.sealBytes(data, `attachment-data:${attachmentId}`));
       return { id: attachmentId, noteId, name, mimeType, size: data.byteLength, createdAt, deletedAt: null };
     });
   }
@@ -291,7 +300,7 @@ export class Repository {
     this.requireAttachmentAccess(userId, noteId);
     const row = this.db.prepare('SELECT * FROM attachments WHERE id = ? AND note_id = ?').get(attachmentId, noteId) as unknown as AttachmentRow | undefined;
     if (!row || row.deleted_at || !row.data) throw new HttpError(404, 'Attachment not found');
-    return { metadata: attachmentMetadata(row), data: row.data };
+    return { metadata: attachmentMetadata(row, this.cipher), data: this.cipher.openBytes(row.data, `attachment-data:${attachmentId}`) };
   }
   deleteAttachment(userId: string, noteId: string, attachmentId: string): AttachmentMetadata {
     return transaction(this.db, () => {
@@ -304,7 +313,7 @@ export class Repository {
         // Keep a permanent tombstone but discard the remote bytes to reclaim space.
         this.db.prepare('UPDATE attachments SET deleted_at = ?, data = NULL WHERE id = ?').run(row.deleted_at, attachmentId);
       }
-      return attachmentMetadata(row);
+      return attachmentMetadata(row, this.cipher);
     });
   }
 }

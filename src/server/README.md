@@ -1,0 +1,15 @@
+# Self-hosted backend notes
+
+Jot's server uses Node 24 and SQLite. `JOT_DATA_DIR` selects its data directory (default `.jot-data` in the working directory). Stop the server before copying the whole directory for a backup, or use a SQLite-aware backup method. Keep backups private. No external account, SMTP provider, or hosted service is required.
+
+The first local account can register by default. To onboard additional users, an operator must explicitly set `JOT_ALLOW_REGISTRATION=true`; set it to `false` to disable all registration. There is no default password. Passwords require at least 12 characters. Sharing grants access to an **existing** account; it does not send an email invitation.
+
+Use HTTPS and a properly configured reverse proxy for non-local access. Set `JOT_APP_ORIGIN` to the canonical public origin (for example, `https://notes.example`) and `JOT_SECURE_COOKIES=true` behind TLS termination. The process uses bounded per-account login/registration throttles and a concurrent password-hashing limit, but these are process-local, not a distributed abuse defense. For a proxy-sanitized client IP, set `JOT_TRUST_PROXY_IP_HEADER` to a header that **your trusted proxy overwrites with exactly one IP address**; otherwise forwarded headers are ignored. Add proxy-level rate limits for public deployments.
+
+Attachments are limited to 10 MiB each. The default owner quota is 1 GiB of live bytes (`JOT_MAX_USER_STORAGE_BYTES`) and 10,000 lifetime attachment records (`JOT_MAX_USER_ATTACHMENT_RECORDS`), including deletion tombstones. Tombstones are retained to prevent deleted IDs from reappearing. These limits can be raised deliberately by the operator. Synchronization receipts contain no note body, are retained for at most 30 days and 10,000 per account, and old retries safely become conflicts rather than overwriting newer content.
+
+## Optional server content encryption
+
+For a **fresh** data directory only, set `JOT_ENCRYPTION_KEY` before the first server start to exactly 64 hexadecimal characters representing a securely generated random 256-bit key. Generate it once with a trusted system random source (for example `openssl rand -hex 32`), store it securely **separately from the database backup**, and provide the same key on every restart. Do not put it in source control. Losing the key makes encrypted content unrecoverable. Wrong or missing keys are rejected; an existing plaintext database is not silently converted. There is no built-in key rotation or plaintext-to-encrypted migration.
+
+In this mode, note and notebook contents, comment text, attachment filenames and bytes are encrypted with AES-256-GCM before SQLite writes them. Account emails, IDs, access relationships, timestamps, attachment MIME types and sizes, and other operational metadata remain plaintext. The server can decrypt content while running: this is **not end-to-end encryption**. Browser/IndexedDB copies and user exports are not encrypted by this server setting. Protect transport with HTTPS, protect devices separately, and back up both data and key.

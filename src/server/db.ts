@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { initializeCipher } from './content-crypto';
 
 /**
  * The database is deliberately local: no hosted account or network service is
@@ -11,14 +12,19 @@ export function openDatabase(filename: string): DatabaseSync {
     mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   }
   const db = new DatabaseSync(filename);
-  if (filename !== ':memory:') {
-    try { chmodSync(filename, 0o600); } catch { /* directory permissions still apply */ }
-  }
-  db.exec(`
+  try {
+    if (filename !== ':memory:') {
+      try { chmodSync(filename, 0o600); } catch { /* directory permissions still apply */ }
+    }
+    db.exec(`
     PRAGMA foreign_keys = ON;
     PRAGMA journal_mode = WAL;
     PRAGMA busy_timeout = 5000;
     PRAGMA secure_delete = ON;
+    `);
+    // Validate the persisted mode and key before modifying application schema.
+    initializeCipher(db, process.env.JOT_ENCRYPTION_KEY);
+    db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       email TEXT NOT NULL UNIQUE,
@@ -113,8 +119,13 @@ export function openDatabase(filename: string): DatabaseSync {
       COMMIT;
     `);
   }
-  db.exec('CREATE INDEX IF NOT EXISTS operations_created ON operations(created_at)');
-  return db;
+    db.exec('CREATE INDEX IF NOT EXISTS operations_created ON operations(created_at)');
+    db.prepare('DELETE FROM operations WHERE created_at < ?').run(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 const globalDb = globalThis as typeof globalThis & { __jotDatabase?: DatabaseSync };

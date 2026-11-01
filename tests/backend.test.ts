@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -387,4 +387,79 @@ test('zero-byte and deleted attachment records count toward an owner quota', () 
     // A valid retry does not consume another record.
     assert.equal(repo.putAttachment(owner.id, item.id, b, 'empty.txt', 'text/plain', now, new Uint8Array()).id, b);
   } finally { db.close(); delete process.env.JOT_MAX_USER_STORAGE_BYTES; delete process.env.JOT_MAX_USER_ATTACHMENT_RECORDS; }
+});
+
+test('optional content-at-rest encryption authenticates key and encrypts all content fields', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'jot-encrypted-'));
+  const filename = path.join(directory, 'jot.sqlite');
+  const key = '11'.repeat(32); // Fixed test fixture, not a deployment key.
+  process.env.JOT_ENCRYPTION_KEY = key;
+  let db: DatabaseSync | undefined;
+  try {
+    db = openDatabase(filename);
+    const owner = user(db, 'encrypted@example.test');
+    let repo = new Repository(db);
+    const book = notebook({ name: 'secret notebook name' });
+    repo.putNotebook(owner.id, randomUUID(), 0, book);
+    const item = note({ notebookId: book.id, title: 'secret title', body: 'uniquely secret note body' });
+    const op = randomUUID();
+    repo.putNote(owner.id, op, 0, item);
+    const comment = repo.addComment(owner, item.id, 'uniquely secret comment');
+    const attachmentId = randomUUID();
+    const payload = new TextEncoder().encode('uniquely secret attachment bytes');
+    repo.putAttachment(owner.id, item.id, attachmentId, 'secret filename.txt', 'text/plain', now, payload);
+    const rawNote = db.prepare('SELECT data_json FROM notes WHERE id=?').get(item.id) as { data_json: string };
+    const rawBook = db.prepare('SELECT data_json FROM notebooks WHERE id=?').get(book.id) as { data_json: string };
+    const rawComment = db.prepare('SELECT body FROM comments WHERE id=?').get(comment.id) as { body: string };
+    const rawAttachment = db.prepare('SELECT name, data FROM attachments WHERE id=?').get(attachmentId) as { name: string; data: Uint8Array };
+    for (const text of [rawNote.data_json, rawBook.data_json, rawComment.body, rawAttachment.name]) assert.match(text, /^jotenc1:/);
+    assert.ok(!Buffer.from(rawAttachment.data).includes(Buffer.from('uniquely secret attachment bytes')));
+    assert.equal(repo.listNotes(owner.id)[0].note.body, item.body);
+    assert.equal(repo.listNotebooks(owner.id)[0].notebook.name, book.name);
+    assert.equal(repo.listComments(owner.id, item.id)[0].body, 'uniquely secret comment');
+    assert.deepEqual(Uint8Array.from(repo.getAttachment(owner.id, item.id, attachmentId).data), payload);
+    assert.equal(repo.putNote(owner.id, op, 0, item).version, 1);
+    db.close(); db = undefined;
+    const disk = readFileSync(filename);
+    for (const secret of ['uniquely secret note body', 'secret notebook name', 'uniquely secret comment', 'secret filename.txt', 'uniquely secret attachment bytes']) {
+      assert.ok(!disk.includes(Buffer.from(secret)), `${secret} leaked to the SQLite file`);
+    }
+    delete process.env.JOT_ENCRYPTION_KEY;
+    assert.throws(() => openDatabase(filename), /JOT_ENCRYPTION_KEY is required/);
+    process.env.JOT_ENCRYPTION_KEY = '22'.repeat(32);
+    assert.throws(() => openDatabase(filename), /does not match/);
+    process.env.JOT_ENCRYPTION_KEY = 'invalid';
+    assert.throws(() => openDatabase(filename), /64 hexadecimal/);
+    process.env.JOT_ENCRYPTION_KEY = key;
+    db = openDatabase(filename); repo = new Repository(db);
+    assert.equal(repo.listNotes(owner.id)[0].note.body, item.body);
+    assert.deepEqual(Uint8Array.from(repo.getAttachment(owner.id, item.id, attachmentId).data), payload);
+    // Notebook removal rewrites encrypted notes without losing content.
+    repo.putNotebook(owner.id, randomUUID(), 1, { ...book, deletedAt: now });
+    assert.equal(repo.listNotes(owner.id)[0].note.body, item.body);
+    assert.equal(repo.listNotes(owner.id)[0].note.notebookId, null);
+    const other = note({ body: 'another encrypted note' });
+    repo.putNote(owner.id, randomUUID(), 0, other);
+    const ciphertext = (db.prepare('SELECT data_json FROM notes WHERE id=?').get(item.id) as { data_json: string }).data_json;
+    db.prepare('UPDATE notes SET data_json=? WHERE id=?').run(ciphertext, other.id);
+    assert.throws(() => repo.listNotes(owner.id), /cannot be authenticated/);
+  } finally { db?.close(); delete process.env.JOT_ENCRYPTION_KEY; rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('a plaintext database cannot silently switch to encrypted mode', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'jot-plaintext-'));
+  const filename = path.join(directory, 'jot.sqlite');
+  let db: DatabaseSync | undefined;
+  try {
+    db = openDatabase(filename);
+    const owner = user(db, 'plaintext@example.test');
+    const item = note({ body: 'still available' });
+    new Repository(db).putNote(owner.id, randomUUID(), 0, item);
+    db.close(); db = undefined;
+    process.env.JOT_ENCRYPTION_KEY = '33'.repeat(32);
+    assert.throws(() => openDatabase(filename), /existing plaintext/);
+    delete process.env.JOT_ENCRYPTION_KEY;
+    db = openDatabase(filename);
+    assert.equal(new Repository(db).listNotes(owner.id)[0].note.body, 'still available');
+  } finally { db?.close(); delete process.env.JOT_ENCRYPTION_KEY; rmSync(directory, { recursive: true, force: true }); }
 });
