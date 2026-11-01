@@ -1,0 +1,223 @@
+import { createHash, randomUUID } from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
+import { HttpError } from './errors';
+import type { PublicUser } from './auth';
+import type { Role, ServerNote, ServerNotebook, ShareRole } from './validation';
+
+interface RecordRow { id: string; owner_id: string; version: number; data_json: string; deleted_at: string | null }
+interface NoteRow extends RecordRow { notebook_id: string | null }
+interface RoleRow extends RecordRow { role: Role }
+interface NoteRoleRow extends NoteRow { role: Role }
+interface Receipt { target: string; payload_hash: string; response_json: string }
+export interface Envelope<T> { note?: T; notebook?: T; version: number; role: Role }
+export interface Share { user: PublicUser; role: ShareRole }
+export interface Comment { id: string; noteId: string; author: PublicUser; body: string; createdAt: string; updatedAt: string }
+
+type Kind = 'note' | 'notebook';
+function transaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try { const result = fn(); db.exec('COMMIT'); return result; }
+  catch (error) { db.exec('ROLLBACK'); throw error; }
+}
+function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+function receipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string): Record<string, unknown> | null {
+  const row = db.prepare('SELECT target, payload_hash, response_json FROM operations WHERE user_id = ? AND operation_id = ?')
+    .get(userId, operationId) as unknown as Receipt | undefined;
+  if (!row) return null;
+  if (row.target !== target || row.payload_hash !== payloadHash) throw new HttpError(409, 'Operation id was already used with different content');
+  return JSON.parse(row.response_json) as Record<string, unknown>;
+}
+function saveReceipt(db: DatabaseSync, userId: string, operationId: string, target: string, payloadHash: string, response: unknown): void {
+  db.prepare('INSERT INTO operations (user_id, operation_id, target, payload_hash, response_json) VALUES (?, ?, ?, ?, ?)')
+    .run(userId, operationId, target, payloadHash, JSON.stringify(response));
+}
+function noteEnvelope(row: NoteRoleRow): { note: ServerNote; version: number; role: Role } {
+  return { note: JSON.parse(row.data_json) as ServerNote, version: row.version, role: row.role };
+}
+function notebookEnvelope(row: RoleRow): { notebook: ServerNotebook; version: number; role: Role } {
+  return { notebook: JSON.parse(row.data_json) as ServerNotebook, version: row.version, role: row.role };
+}
+
+// A notebook grant covers its notes; direct and inherited permissions combine
+// using the stronger role. Once a notebook is trashed, it grants no note access.
+const noteSelect = `SELECT n.*,
+  CASE WHEN n.owner_id = ? THEN 'owner'
+       WHEN direct.role = 'editor' OR inherited.role = 'editor' THEN 'editor'
+       WHEN direct.role = 'viewer' OR inherited.role = 'viewer' THEN 'viewer'
+       ELSE NULL END AS role
+  FROM notes n
+  LEFT JOIN note_shares direct ON direct.note_id = n.id AND direct.user_id = ?
+  LEFT JOIN notebooks b ON b.id = n.notebook_id AND b.deleted_at IS NULL
+  LEFT JOIN notebook_shares inherited ON inherited.notebook_id = b.id AND inherited.user_id = ?`;
+const notebookSelect = `SELECT b.*,
+  CASE WHEN b.owner_id = ? THEN 'owner' ELSE shared.role END AS role
+  FROM notebooks b LEFT JOIN notebook_shares shared ON shared.notebook_id = b.id AND shared.user_id = ?`;
+
+export class Repository {
+  constructor(private readonly db: DatabaseSync) {}
+  private noteRow(userId: string, noteId: string): NoteRoleRow | undefined {
+    const row = this.db.prepare(`${noteSelect} WHERE n.id = ?`).get(userId, userId, userId, noteId) as unknown as NoteRoleRow | undefined;
+    return row?.role ? row : undefined;
+  }
+  private notebookRow(userId: string, notebookId: string): RoleRow | undefined {
+    const row = this.db.prepare(`${notebookSelect} WHERE b.id = ?`).get(userId, userId, notebookId) as unknown as RoleRow | undefined;
+    return row?.role ? row : undefined;
+  }
+  private ownerRow(kind: Kind, userId: string, resourceId: string): RecordRow {
+    const row = kind === 'note' ? this.noteRow(userId, resourceId) : this.notebookRow(userId, resourceId);
+    if (!row) throw new HttpError(404, `${kind === 'note' ? 'Note' : 'Notebook'} not found`);
+    if (row.role !== 'owner') throw new HttpError(403, 'Only the owner can manage sharing');
+    return row;
+  }
+  listNotes(userId: string): Array<{ note: ServerNote; version: number; role: Role }> {
+    const rows = this.db.prepare(`${noteSelect} WHERE n.owner_id = ? OR direct.user_id IS NOT NULL OR inherited.user_id IS NOT NULL`)
+      .all(userId, userId, userId, userId) as unknown as NoteRoleRow[];
+    return rows.map(noteEnvelope);
+  }
+  listNotebooks(userId: string): Array<{ notebook: ServerNotebook; version: number; role: Role }> {
+    const rows = this.db.prepare(`${notebookSelect} WHERE b.owner_id = ? OR shared.user_id IS NOT NULL`)
+      .all(userId, userId, userId) as unknown as RoleRow[];
+    return rows.map(notebookEnvelope);
+  }
+  putNote(userId: string, operationId: string, baseVersion: number, input: ServerNote): { note: ServerNote; version: number; role: Role } {
+    const payloadHash = digest({ baseVersion, note: input });
+    const target = `note:${input.id}`;
+    return transaction(this.db, () => {
+      const existing = this.db.prepare('SELECT * FROM notes WHERE id = ?').get(input.id) as unknown as NoteRow | undefined;
+      const current = existing ? this.noteRow(userId, input.id) : undefined;
+      if (existing && !current) throw new HttpError(404, 'Note not found');
+      const prior = receipt(this.db, userId, operationId, target, payloadHash);
+      if (prior) {
+        if (!current) throw new HttpError(404, 'Note not found');
+        return { ...(prior as unknown as { note: ServerNote; version: number; role: Role }), role: current.role };
+      }
+      if (current?.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+      if (existing && existing.version !== baseVersion) {
+        throw new HttpError(409, 'conflict', { serverVersion: existing.version, serverNote: JSON.parse(existing.data_json) });
+      }
+      if (!existing && baseVersion !== 0) throw new HttpError(409, 'Note does not exist');
+      if (existing && current?.role !== 'owner' && existing.notebook_id !== input.notebookId) {
+        throw new HttpError(403, 'Only the owner can move a note');
+      }
+      let ownerId = existing?.owner_id || userId;
+      // Direct access to a note does not imply access to its notebook. Check
+      // the destination only for creation or an actual move.
+      if (input.notebookId && (!existing || existing.notebook_id !== input.notebookId)) {
+        const notebook = this.notebookRow(userId, input.notebookId);
+        if (!notebook || notebook.deleted_at) throw new HttpError(404, 'Notebook not found');
+        if (notebook.role === 'viewer') throw new HttpError(403, 'This notebook is read-only');
+        if (existing && notebook.owner_id !== existing.owner_id) throw new HttpError(403, 'Notes cannot be moved between owners');
+        if (!existing) ownerId = notebook.owner_id;
+      }
+      const version = (existing?.version || 0) + 1;
+      if (existing) {
+        this.db.prepare('UPDATE notes SET notebook_id = ?, version = ?, data_json = ?, deleted_at = ? WHERE id = ?')
+          .run(input.notebookId, version, JSON.stringify(input), input.deletedAt, input.id);
+      } else {
+        this.db.prepare('INSERT INTO notes (id, owner_id, notebook_id, version, data_json, deleted_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(input.id, ownerId, input.notebookId, version, JSON.stringify(input), input.deletedAt);
+      }
+      const updated = this.noteRow(userId, input.id);
+      if (!updated) throw new HttpError(403, 'No access to note');
+      const response = noteEnvelope(updated);
+      saveReceipt(this.db, userId, operationId, target, payloadHash, response);
+      return response;
+    });
+  }
+  putNotebook(userId: string, operationId: string, baseVersion: number, input: ServerNotebook): { notebook: ServerNotebook; version: number; role: Role } {
+    const payloadHash = digest({ baseVersion, notebook: input });
+    const target = `notebook:${input.id}`;
+    return transaction(this.db, () => {
+      const existing = this.db.prepare('SELECT * FROM notebooks WHERE id = ?').get(input.id) as unknown as RecordRow | undefined;
+      const current = existing ? this.notebookRow(userId, input.id) : undefined;
+      if (existing && !current) throw new HttpError(404, 'Notebook not found');
+      const prior = receipt(this.db, userId, operationId, target, payloadHash);
+      if (prior) {
+        if (!current) throw new HttpError(404, 'Notebook not found');
+        return { ...(prior as unknown as { notebook: ServerNotebook; version: number; role: Role }), role: current.role };
+      }
+      if (current?.role === 'viewer') throw new HttpError(403, 'This notebook is read-only');
+      if (existing && existing.version !== baseVersion) {
+        throw new HttpError(409, 'conflict', { serverVersion: existing.version, serverNotebook: JSON.parse(existing.data_json) });
+      }
+      if (!existing && baseVersion !== 0) throw new HttpError(409, 'Notebook does not exist');
+      if (existing && existing.deleted_at !== input.deletedAt && current?.role !== 'owner') {
+        throw new HttpError(403, 'Only the owner can trash or restore a notebook');
+      }
+      const version = (existing?.version || 0) + 1;
+      if (existing) {
+        this.db.prepare('UPDATE notebooks SET version = ?, data_json = ?, deleted_at = ? WHERE id = ?')
+          .run(version, JSON.stringify(input), input.deletedAt, input.id);
+      } else {
+        this.db.prepare('INSERT INTO notebooks (id, owner_id, version, data_json, deleted_at) VALUES (?, ?, ?, ?, ?)')
+          .run(input.id, userId, version, JSON.stringify(input), input.deletedAt);
+      }
+      // A deleted notebook does not delete notes. Detach them atomically and
+      // bump each note's version so stale offline changes conflict safely.
+      if (existing && !existing.deleted_at && input.deletedAt) {
+        const notes = this.db.prepare('SELECT * FROM notes WHERE notebook_id = ?').all(input.id) as unknown as NoteRow[];
+        const update = this.db.prepare('UPDATE notes SET notebook_id = NULL, version = ?, data_json = ? WHERE id = ?');
+        const now = new Date().toISOString();
+        for (const item of notes) {
+          const note = JSON.parse(item.data_json) as ServerNote;
+          note.notebookId = null;
+          note.updatedAt = now;
+          update.run(item.version + 1, JSON.stringify(note), item.id);
+        }
+      }
+      const updated = this.notebookRow(userId, input.id);
+      if (!updated) throw new HttpError(403, 'No access to notebook');
+      const response = notebookEnvelope(updated);
+      saveReceipt(this.db, userId, operationId, target, payloadHash, response);
+      return response;
+    });
+  }
+  listShares(kind: Kind, userId: string, resourceId: string): Share[] {
+    this.ownerRow(kind, userId, resourceId);
+    const table = kind === 'note' ? 'note_shares' : 'notebook_shares';
+    const column = kind === 'note' ? 'note_id' : 'notebook_id';
+    const rows = this.db.prepare(`SELECT users.id, users.email, shares.role FROM ${table} shares JOIN users ON users.id = shares.user_id WHERE shares.${column} = ? ORDER BY users.email`)
+      .all(resourceId) as unknown as Array<{ id: string; email: string; role: ShareRole }>;
+    return rows.map((row) => ({ user: { id: row.id, email: row.email }, role: row.role }));
+  }
+  changeShare(kind: Kind, userId: string, resourceId: string, targetEmail: string, role: ShareRole | null): Share[] {
+    return transaction(this.db, () => {
+      this.ownerRow(kind, userId, resourceId);
+      const target = this.db.prepare('SELECT id FROM users WHERE email = ?').get(targetEmail) as unknown as { id: string } | undefined;
+      if (!target) throw new HttpError(404, 'Account not found');
+      if (target.id === userId) throw new HttpError(400, 'The owner already has access');
+      const table = kind === 'note' ? 'note_shares' : 'notebook_shares';
+      const column = kind === 'note' ? 'note_id' : 'notebook_id';
+      if (role) this.db.prepare(`INSERT INTO ${table} (${column}, user_id, role) VALUES (?, ?, ?) ON CONFLICT(${column}, user_id) DO UPDATE SET role = excluded.role`)
+        .run(resourceId, target.id, role);
+      else this.db.prepare(`DELETE FROM ${table} WHERE ${column} = ? AND user_id = ?`).run(resourceId, target.id);
+      return this.listShares(kind, userId, resourceId);
+    });
+  }
+  listComments(userId: string, noteId: string): Comment[] {
+    if (!this.noteRow(userId, noteId)) throw new HttpError(404, 'Note not found');
+    const rows = this.db.prepare(`SELECT c.id, c.note_id, c.body, c.created_at, c.updated_at, u.id AS author_id, u.email AS author_email
+      FROM comments c JOIN users u ON u.id = c.author_id WHERE c.note_id = ? ORDER BY c.created_at, c.id`).all(noteId) as unknown as Array<{
+        id: string; note_id: string; body: string; created_at: string; updated_at: string; author_id: string; author_email: string;
+      }>;
+    return rows.map((row) => ({ id: row.id, noteId: row.note_id, author: { id: row.author_id, email: row.author_email }, body: row.body, createdAt: row.created_at, updatedAt: row.updated_at }));
+  }
+  addComment(user: PublicUser, noteId: string, body: string): Comment {
+    const row = this.noteRow(user.id, noteId);
+    if (!row) throw new HttpError(404, 'Note not found');
+    if (row.role === 'viewer') throw new HttpError(403, 'This note is read-only');
+    const now = new Date().toISOString();
+    const comment = { id: randomUUID(), noteId, author: user, body, createdAt: now, updatedAt: now };
+    this.db.prepare('INSERT INTO comments (id, note_id, author_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(comment.id, noteId, user.id, body, now, now);
+    return comment;
+  }
+  deleteComment(userId: string, noteId: string, commentId: string): void {
+    const note = this.noteRow(userId, noteId);
+    if (!note) throw new HttpError(404, 'Note not found');
+    const comment = this.db.prepare('SELECT author_id FROM comments WHERE id = ? AND note_id = ?').get(commentId, noteId) as unknown as { author_id: string } | undefined;
+    if (!comment) throw new HttpError(404, 'Comment not found');
+    if (comment.author_id !== userId && note.role !== 'owner') throw new HttpError(403, 'Only the author or note owner can delete this comment');
+    this.db.prepare('DELETE FROM comments WHERE id = ?').run(commentId);
+  }
+}
