@@ -116,6 +116,7 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
               {busy === 'auth' ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
             </button>
           </form>
+          {mode === 'register' && <p className="collab-hint">By default, only the first account can register. An operator can enable additional accounts with <code>JOT_ALLOW_REGISTRATION=true</code>.</p>}
           <p className="collab-fineprint"><ShieldCheck size={14} aria-hidden="true" /> Signing in never uploads guest notes. You can choose to copy them later.</p>
         </div>
       )}
@@ -145,7 +146,7 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
               <button type="button" className="collab-button" onClick={() => { setConfirmCopy(true); setNotice(null); }} disabled={!!busy || !account.workspaceReady}>Copy guest notes…</button>
             ) : (
               <div className="collab-confirm">
-                <p>This copies guest notes into this account. The copies will begin syncing automatically and may be uploaded to your server. Guest originals remain on this device; attachments stay local. Repeating this adds only guest notes not copied before; it does not update existing copies or overwrite account edits.</p>
+                <p>This copies guest notes, their notebooks, and attached files into this account. The copies can be uploaded to your server automatically when online. Guest originals remain on this device. Repeating this adds only guest notes not copied before; it does not update existing copies or overwrite account edits.</p>
                 <div className="collab-actions collab-actions-start">
                   <button type="button" className="collab-button collab-primary" onClick={copyGuest} disabled={!!busy || !account.workspaceReady}>{busy === 'copy' ? 'Copying…' : 'Copy and allow sync'}</button>
                   <button type="button" className="collab-button collab-ghost" onClick={() => setConfirmCopy(false)} disabled={!!busy}>Cancel</button>

@@ -6,12 +6,14 @@ import { CollaborationApiError, messageForError, request, type CollaborationSess
 
 export interface CollaborationWorkspace {
   workspaceId: string | null;
+  /** Flush or reject unsaved drafts before changing the server session. */
+  prepareWorkspaceSwitch: () => Promise<void>;
   switchWorkspace: (userId: string | null) => Promise<void>;
   copyGuestNotesToAccount: (userId: string) => Promise<number>;
   syncNow: () => Promise<SyncResult>;
   syncStatus: SyncStatus;
   listConflicts: () => Promise<SyncConflict[]>;
-  resolveConflict: (id: string, choice: 'local' | 'server' | 'both') => Promise<void>;
+  resolveConflict: (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number) => Promise<void>;
 }
 
 type SessionStatus = 'checking' | 'ready' | 'error';
@@ -37,7 +39,7 @@ interface CollaborationContextValue {
   syncNow: () => Promise<SyncResult>;
   importGuestNotes: () => Promise<number>;
   listConflicts: () => Promise<SyncConflict[]>;
-  resolveConflict: (id: string, choice: 'local' | 'server' | 'both') => Promise<void>;
+  resolveConflict: (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number) => Promise<void>;
   authenticatedRequest: <T>(path: string, options?: RequestOptions) => Promise<T>;
 }
 
@@ -98,12 +100,14 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
         setSessionStatus('ready');
       }
     } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Local storage is unavailable.';
+      const message = `Could not open the confirmed workspace. ${reason} Your current local workspace was not reset.`;
       if (currentOperation === operation.current && mounted.current) {
         setWorkspacePhase('error');
-        setSessionError('Your account was checked, but its local workspace could not be opened. Try checking the session again.');
+        setSessionError(message);
         setSessionStatus('error');
       }
-      throw error;
+      throw new Error(message);
     }
   }, []);
 
@@ -118,7 +122,7 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     } catch (error) {
       if (currentOperation === operation.current && mounted.current) {
         setSessionStatus('error');
-        setSessionError(error instanceof Error && error.message.startsWith('Your account')
+        setSessionError(error instanceof Error && error.message.startsWith('Could not open the confirmed workspace.')
           ? error.message
           : 'Could not check your session. Your local workspace has not been changed. Check your connection and retry.');
       }
@@ -130,15 +134,27 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
 
   const authenticate = useCallback(async (mode: 'login' | 'register', email: string, password: string) => {
     const currentOperation = ++operation.current;
+    let requestStarted = false;
+    let responseConfirmed = false;
     try {
+      // Do not change server identity while there is an unflushed local draft.
+      await workspaceRef.current.prepareWorkspaceSwitch();
+      requestStarted = true;
       const next = validSession(await request<CollaborationSession>(`/api/auth/${mode}`, {
         method: 'POST', body: { email, password },
       }));
+      responseConfirmed = true;
       if (currentOperation !== operation.current || !mounted.current) return;
       setSessionStatus('checking');
       await applySession(next, currentOperation);
     } catch (error) {
-      // Failed credentials leave the previously confirmed guest workspace alone.
+      // A network failure can occur after the server has changed the cookie.
+      // Do not assume the account is still guest or retry a registration blindly.
+      if (requestStarted && !responseConfirmed && !(error instanceof CollaborationApiError && error.status >= 400 && error.status < 500)
+          && currentOperation === operation.current && mounted.current) {
+        setSessionStatus('error');
+        setSessionError('Could not confirm the account request. Your local workspace has not been changed. Check the session before trying again.');
+      }
       throw error;
     }
   }, [applySession]);
@@ -151,15 +167,28 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     const currentOperation = ++operation.current;
     setSessionStatus('checking');
     setSessionError(null);
+    let requestStarted = false;
+    let serverSignedOut = false;
     try {
       if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
       if (resolutionInFlight.current) await resolutionInFlight.current.catch(() => undefined);
+      await workspaceRef.current.prepareWorkspaceSwitch();
+      requestStarted = true;
       await request<{ ok: true }>('/api/auth/logout', { method: 'POST', csrfToken: session.csrfToken });
+      serverSignedOut = true;
       await applySession({ user: null, csrfToken: null }, currentOperation);
     } catch (error) {
       if (currentOperation === operation.current && mounted.current) {
-        setSessionStatus('error');
-        setSessionError('Could not confirm sign-out. Your local workspace has not been changed. Check the session and try again.');
+        if (!requestStarted) {
+          setSessionStatus('ready');
+          setSessionError(null);
+        } else if (serverSignedOut) {
+          setSessionStatus('error');
+          setSessionError('Signed out on the server, but the guest workspace could not be opened. Your account data remains on this device. Resolve any unsaved drafts, then check the session again.');
+        } else {
+          setSessionStatus('error');
+          setSessionError('Could not confirm sign-out. Your local workspace has not been changed. Check the session and try again.');
+        }
       }
       throw error;
     }
@@ -222,12 +251,12 @@ export function CollaborationProvider({ workspace, children }: { workspace: Coll
     return workspaceRef.current.listConflicts();
   }, [session, workspaceReady]);
 
-  const resolveConflict = useCallback(async (id: string, choice: 'local' | 'server' | 'both') => {
+  const resolveConflict = useCallback(async (id: string, choice: 'local' | 'server' | 'both', expectedRevision: number) => {
     if (!session?.user || !workspaceReady) throw new Error('Check your account session before resolving conflicts.');
     if (resolutionInFlight.current) throw new Error('A conflict is already being resolved.');
     const pending = (async () => {
       if (syncInFlight.current) await syncInFlight.current.catch(() => undefined);
-      await workspaceRef.current.resolveConflict(id, choice);
+      await workspaceRef.current.resolveConflict(id, choice, expectedRevision);
       const remaining = await workspaceRef.current.listConflicts();
       if (mounted.current) {
         setSyncMessage(remaining.length ? `${remaining.length} ${remaining.length === 1 ? 'conflict needs' : 'conflicts need'} your attention. Your local changes were kept.` : null);

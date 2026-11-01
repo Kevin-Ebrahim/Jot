@@ -58,12 +58,16 @@ export function ConflictList({ active }: { active: boolean }) {
     if (!choice || busy) return;
     setBusy(true); setError(null); setNotice(null);
     try {
-      await account.resolveConflict(conflict.id, choice);
+      await account.resolveConflict(conflict.id, choice, conflict.local.revision);
       setExpanded(null); setChoice(null);
       setNotice('Choice saved. Any remaining changes will sync automatically when online.');
       await load();
-    } catch (caught) { setError(messageForError(caught)); }
-    finally { setBusy(false); }
+    } catch (caught) {
+      const message = messageForError(caught);
+      await load();
+      setChoice(null);
+      setError(`${message} Review the current versions and try again.`);
+    } finally { setBusy(false); }
   }
 
   if (!active) return null;

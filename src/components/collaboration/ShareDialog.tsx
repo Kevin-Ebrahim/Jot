@@ -64,7 +64,7 @@ export function ShareDialog({ open, onClose, note, notebook }: {
       setRevokeEmail(null);
       if (method === 'POST') { setEmail(''); setNotice('Access added. No invitation email was sent.'); }
       if (method === 'PATCH') setNotice('Access updated.');
-      if (method === 'DELETE') setNotice('Direct access removed.');
+      if (method === 'DELETE') setNotice(kind === 'note' ? 'Direct access removed. Access through a shared notebook may still apply.' : 'Notebook access removed. Direct note access may still apply.');
     } catch (caught) {
       if (current === sequence.current) setError(messageForError(caught));
     } finally { if (current === sequence.current) setBusy(false); }
