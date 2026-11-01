@@ -46,3 +46,6 @@
 .footer { display: flex; align-items: center; gap: 9px; padding: 15px 24px; border-top: 1px solid var(--border); }
 .privacy { flex: 1; color: var(--subtle); font-size: 10px; line-height: 1.4; }
 @media (max-width: 560px) { .header, .content, .footer { padding-left: 16px; padding-right: 16px; } .footer { flex-wrap: wrap; } .privacy { flex-basis: 100%; } }
+
+.transcriptLabel { display: grid; gap: 5px; margin-top: 10px; color: var(--muted); font-size: 10px; font-weight: 600; }
+.transcriptInput { width: 100%; min-height: 85px; padding: 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); line-height: 1.5; resize: vertical; }

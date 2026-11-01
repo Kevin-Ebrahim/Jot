@@ -142,3 +142,109 @@ test("OCR wrapper resolves, cancels and reports worker errors without leaving a 
     if (previousWorker) Object.defineProperty(globalThis, "Worker", previousWorker); else Reflect.deleteProperty(globalThis, "Worker");
   }
 });
+
+test("on-device audio bounds and segments are explicit and lossless", async () => {
+  const { validateAudioDuration, MAX_TRANSCRIPTION_BYTES, decodeAudioToMono16k } = await import("../src/lib/features/audio-transcription");
+  const { transcriptionSegments, isAudioEffectivelySilent } = await import("../src/lib/features/transcription-segments");
+  assert.doesNotThrow(() => validateAudioDuration(120));
+  assert.throws(() => validateAudioDuration(120.01), /up to 2 minutes/);
+  assert.throws(() => validateAudioDuration(Infinity), /duration/);
+  await assert.rejects(decodeAudioToMono16k({ size: MAX_TRANSCRIPTION_BYTES + 1 } as Blob), /10 MiB/);
+  const samples = new Float32Array(70 * 16_000);
+  samples.fill(.1, 16_000, 22 * 16_000);
+  const segments = transcriptionSegments(samples);
+  assert.ok(segments.length >= 3);
+  assert.equal(segments[0].start, 0);
+  assert.equal(segments.at(-1)?.end, samples.length);
+  for (let i = 0; i < segments.length; i += 1) {
+    assert.ok(segments[i].end - segments[i].start <= 29 * 16_000);
+    if (i) assert.equal(segments[i - 1].end, segments[i].start);
+  }
+  assert.equal(isAudioEffectivelySilent(new Float32Array(100)), true);
+  assert.equal(isAudioEffectivelySilent(new Float32Array([0, .1])), false);
+});
+
+test("audio decoding stays local and transcription worker cancellation terminates it", async () => {
+  const { decodeAudioToMono16k, transcribeAudioOnDevice } = await import("../src/lib/features/audio-transcription");
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const previousWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  const createUrl = URL.createObjectURL;
+  const revokeUrl = URL.revokeObjectURL;
+  const previousFetch = globalThis.fetch;
+  class FakeMedia extends EventTarget {
+    duration = Infinity;
+    readyState = 1;
+    preload = "";
+    src = "";
+    set currentTime(_value: number) { this.duration = 2; queueMicrotask(() => this.dispatchEvent(new Event("durationchange"))); }
+    load() { if (this.src) queueMicrotask(() => this.dispatchEvent(new Event("loadedmetadata"))); }
+    removeAttribute() { this.src = ""; }
+  }
+  class FakeOfflineAudioContext {
+    constructor(_channels: number, _length: number, _rate: number) { /* test double */ }
+    async decodeAudioData(_bytes: ArrayBuffer) {
+      return { duration: 2, sampleRate: 16_000, numberOfChannels: 2, length: 4,
+        getChannelData: (channel: number) => channel ? new Float32Array([.1, .2, .3, .4]) : new Float32Array([.3, .4, .5, .6]) };
+    }
+  }
+  let last: FakeWorker | undefined;
+  let workerReady: (() => void) | undefined;
+  class FakeWorker {
+    onmessage?: (event: { data: unknown }) => void;
+    onerror?: (event: { message: string }) => void;
+    onmessageerror?: () => void;
+    terminated = 0;
+    samples?: Float32Array;
+    constructor() { last = this; workerReady?.(); }
+    postMessage(message: { samples: Float32Array }) { this.samples = message.samples; }
+    terminate() { this.terminated += 1; }
+  }
+  Object.defineProperty(globalThis, "document", { configurable: true, value: { createElement: () => new FakeMedia() } });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { OfflineAudioContext: FakeOfflineAudioContext } });
+  Object.defineProperty(globalThis, "Worker", { configurable: true, value: FakeWorker });
+  URL.createObjectURL = () => "blob:local-test";
+  URL.revokeObjectURL = () => undefined;
+  globalThis.fetch = (() => { throw new Error("Audio decoding must not fetch or upload"); }) as typeof fetch;
+  try {
+    const file = new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" });
+    const mono = await decodeAudioToMono16k(file);
+    assert.equal(mono.length, 4);
+    assert.ok(Math.abs(mono[0] - .2) < .00001);
+    const controller = new AbortController();
+    const ready = new Promise<void>((resolve) => { workerReady = resolve; });
+    const pending = transcribeAudioOnDevice(file, undefined, controller.signal);
+    await ready;
+    assert.ok(last);
+    const worker: FakeWorker = last;
+    assert.ok(worker.samples instanceof Float32Array);
+    controller.abort();
+    await assert.rejects(pending, { name: "AbortError" });
+    assert.equal(worker.terminated, 1);
+    assert.equal(worker.onmessage, null);
+
+    let progress = "";
+    const readyAgain = new Promise<void>((resolve) => { workerReady = resolve; });
+    const successful = transcribeAudioOnDevice(file, (message) => { progress = message; });
+    await readyAgain;
+    assert.ok(last); const successWorker: FakeWorker = last;
+    successWorker.onmessage?.({ data: { type: "progress", message: "Transcribing part 1 of 1" } });
+    assert.equal(progress, "Transcribing part 1 of 1");
+    successWorker.onmessage?.({ data: { type: "done", text: "Only words returned by the model" } });
+    assert.equal(await successful, "Only words returned by the model");
+    assert.equal(successWorker.terminated, 1);
+
+    const readyFailure = new Promise<void>((resolve) => { workerReady = resolve; });
+    const failing = transcribeAudioOnDevice(file);
+    await readyFailure;
+    assert.ok(last); const failedWorker: FakeWorker = last;
+    failedWorker.onmessage?.({ data: { type: "error", message: "Model download failed" } });
+    await assert.rejects(failing, /Model download failed/);
+    assert.equal(failedWorker.terminated, 1);
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument); else Reflect.deleteProperty(globalThis, "document");
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow); else Reflect.deleteProperty(globalThis, "window");
+    if (previousWorker) Object.defineProperty(globalThis, "Worker", previousWorker); else Reflect.deleteProperty(globalThis, "Worker");
+    URL.createObjectURL = createUrl; URL.revokeObjectURL = revokeUrl; globalThis.fetch = previousFetch;
+  }
+});

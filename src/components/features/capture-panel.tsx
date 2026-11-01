@@ -5,6 +5,7 @@ import { AudioLines, FileAudio, FileImage, FileText, ImagePlus, Link2, Mic, Pape
 import type { NewNote } from "@/lib/types";
 import { extractImageText, extractPdfText, htmlToPlainText } from "@/lib/features/extraction";
 import { escapeImportedText } from "@/lib/features/imported-text";
+import { transcribeAudioOnDevice } from "@/lib/features/audio-transcription";
 import styles from "./capture-panel.module.css";
 
 export interface CapturePanelProps {
@@ -34,7 +35,7 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const makeId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const isImage = (file: File) => file.type.startsWith("image/") && file.type !== "image/svg+xml";
 const isPdf = (file: File) => file.type === "application/pdf" || /\.pdf$/i.test(file.name);
-const isAudio = (file: File) => file.type.startsWith("audio/");
+const isAudio = (file: File) => file.type.startsWith("audio/") || ((!file.type || file.type === "application/octet-stream" || file.type.startsWith("video/")) && /\.(?:wav|mp3|m4a|aac|ogg|opus|webm|flac)$/i.test(file.name));
 const fileLabel = (file: File) => `${file.name} · ${file.size < 1_000_000 ? `${Math.max(1, Math.round(file.size / 1024))} KB` : `${(file.size / 1_000_000).toFixed(1)} MB`}`;
 const cleanName = (name: string) => name.replace(/[\r\n]+/g, " ").replace(/[#\[\]\\]/g, "").trim();
 
@@ -112,21 +113,21 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
     if (mounted.current) setFiles((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
   }, []);
 
-  const runExtraction = useCallback(async (item: PendingFile, kind: "pdf" | "image") => {
+  const runExtraction = useCallback(async (item: PendingFile, kind: "pdf" | "image" | "audio") => {
     const controller = new AbortController();
     controllers.current.get(item.id)?.abort();
     controllers.current.set(item.id, controller);
-    updateFile(item.id, { state: "working", message: kind === "pdf" ? "Reading PDF…" : "Loading recognition…", extracted: "" });
+    updateFile(item.id, { state: "working", message: kind === "pdf" ? "Reading PDF…" : kind === "audio" ? "Preparing local transcription…" : "Loading recognition…", extracted: "" });
     try {
       const progress = (message: string) => updateFile(item.id, { message });
-      const text = kind === "pdf"
-        ? await extractPdfText(item.file, progress, controller.signal)
+      const text = kind === "pdf" ? await extractPdfText(item.file, progress, controller.signal)
+        : kind === "audio" ? await transcribeAudioOnDevice(item.file, progress, controller.signal)
         : await extractImageText(item.file, progress, controller.signal);
       if (!controller.signal.aborted) updateFile(item.id, text
-        ? { state: "done", message: `${text.length.toLocaleString()} characters ready to search`, extracted: text }
-        : { state: "empty", message: kind === "pdf" ? "No selectable text found. Scanned PDF pages aren’t recognized yet." : "No text recognized. You can still save the image.", extracted: "" });
+        ? { state: "done", message: kind === "audio" ? "Review and edit this transcript before saving." : `${text.length.toLocaleString()} characters ready to search`, extracted: text }
+        : { state: "empty", message: kind === "pdf" ? "No selectable text found. Scanned PDF pages aren’t recognized yet." : kind === "audio" ? "No speech was recognized. The recording can still be saved." : "No text recognized. You can still save the image.", extracted: "" });
     } catch (cause) {
-      if (!controller.signal.aborted) updateFile(item.id, { state: "error", message: cause instanceof Error ? `Text extraction failed: ${cause.message}` : "Text extraction failed. You can still save the file.", extracted: "" });
+      if (!controller.signal.aborted) updateFile(item.id, { state: "error", message: cause instanceof Error ? `${kind === "audio" ? "Transcription" : "Text extraction"} failed: ${cause.message}` : "Processing failed. You can still save the file.", extracted: "" });
     } finally {
       if (controllers.current.get(item.id) === controller) controllers.current.delete(item.id);
     }
@@ -135,7 +136,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
   const addFiles = useCallback((incoming: File[]) => {
     const tooLarge = incoming.filter((file) => file.size > MAX_ATTACHMENT_BYTES);
     if (tooLarge.length) setError(`${tooLarge.map((file) => file.name).join(", ")} ${tooLarge.length === 1 ? "is" : "are"} over the 10 MiB per-file limit and ${tooLarge.length === 1 ? "was" : "were"} not added.`);
-    const added = incoming.filter((file) => file.size <= MAX_ATTACHMENT_BYTES).map((file): PendingFile => ({ id: makeId(), file, state: "ready", message: isImage(file) ? "Image attached. Choose Make searchable to run OCR." : isAudio(file) ? "Audio attached. Existing recordings cannot be transcribed here." : "Attached to this note.", extracted: "" }));
+    const added = incoming.filter((file) => file.size <= MAX_ATTACHMENT_BYTES).map((file): PendingFile => ({ id: makeId(), file, state: "ready", message: isImage(file) ? "Image attached. Choose Make searchable to run OCR." : isAudio(file) ? "Audio attached. You can transcribe it on this device." : "Attached to this note.", extracted: "" }));
     setFiles((current) => [...current, ...added]);
     for (const item of added) if (isPdf(item.file)) void runExtraction(item, "pdf");
   }, [runExtraction]);
@@ -148,7 +149,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
   const cancelExtraction = (id: string) => {
     controllers.current.get(id)?.abort();
     controllers.current.delete(id);
-    updateFile(id, { state: "ready", message: "Text extraction stopped. The file can still be saved.", extracted: "" });
+    updateFile(id, { state: "ready", message: "Processing stopped. The file can still be saved.", extracted: "" });
   };
 
   const startRecording = async () => {
@@ -291,7 +292,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
     setError("");
     if (recordState !== "idle") { setError("Stop the recording before saving."); return; }
     if (speechState !== "idle") { setError("Stop live transcription before saving."); return; }
-    if (files.some((item) => item.state === "working")) { setError("Wait for text extraction or stop it before saving."); return; }
+    if (files.some((item) => item.state === "working")) { setError("Wait for transcription or text extraction, or stop it before saving."); return; }
     if (hasSketch) { setError("Add your sketch to the note or clear it before saving."); setMode("sketch"); return; }
     if (overflowRecording) { setError("Download or discard the oversized recording before saving."); setMode("voice"); return; }
     let attemptedSave = false;
@@ -310,7 +311,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
         else throw new Error("The imported HTML didn’t contain any readable text.");
       }
       if (transcript.trim()) sections.push(`### Live transcript\n\n${escapeImportedText(transcript.trim())}`);
-      for (const item of files) if (item.extracted) sections.push(`### Extracted from ${escapeImportedText(cleanName(item.file.name))}\n\n${escapeImportedText(item.extracted)}`);
+      for (const item of files) if (item.extracted) sections.push(`### ${isAudio(item.file) ? "Transcript of" : "Extracted from"} ${escapeImportedText(cleanName(item.file.name))}\n\n${escapeImportedText(item.extracted)}`);
       const noteBody = sections.filter(Boolean).join("\n\n");
       if (noteBody.length > 1_000_000) throw new Error("This note exceeds the 1,000,000-character limit. Shorten it or choose ‘Keep file only’ for an extracted attachment.");
       setBusy(true);
@@ -354,7 +355,7 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
             <button type="button" className={styles.smallButton} onClick={() => audioInput.current?.click()} disabled={recordState !== "idle"}><Upload size={14} /> Attach audio</button><input ref={audioInput} type="file" accept="audio/*" multiple hidden onChange={(event) => { addFiles(Array.from(event.target.files || [])); event.target.value = ""; }} />
           </div>
           {overflowRecording && <div className={styles.transcript}><p style={{ margin: 0 }}>This recording is too large to attach. Download it, then discard this local copy to continue.</p><div className={styles.actions}>{overflowUrl && <a className={styles.smallButton} href={overflowUrl} download={overflowRecording.name}>Download recording</a>}<button type="button" className={styles.smallButton} onClick={() => { setOverflowRecording(null); setError(""); }}>Discard local copy</button></div></div>}
-          <p className={styles.copy} style={{ marginTop: 12 }}>Optional live transcription uses your browser’s speech service, which may send audio to its provider. It listens only after you start it; existing audio files cannot be transcribed here.</p>
+          <p className={styles.copy} style={{ marginTop: 12 }}>Optional live transcription uses your browser’s speech service, which may send audio to its provider. It listens only after you start it. For existing recordings, use “Transcribe on device” below instead.</p>
           <div className={styles.actions}>{speechState !== "idle" ? <button type="button" className={styles.smallButton} onClick={stopTranscription} disabled={speechState === "stopping"}><Square size={12} /> {speechState === "stopping" ? "Finishing transcript…" : "Stop live transcript"}</button> : <button type="button" className={styles.smallButton} onClick={startTranscription} disabled={!recognitionSupported}><AudioLines size={14} /> {recognitionSupported ? "Start live transcript" : "Live transcript unavailable"}</button>}</div>
           {(transcript || interim) && <div className={styles.transcript} aria-live="polite">{transcript}{interim && <span style={{ opacity: .6 }}> {interim}</span>}</div>}
         </div>}
@@ -372,9 +373,10 @@ export function CapturePanel({ onClose, onCreate }: CapturePanelProps) {
           <canvas ref={canvas} className={styles.canvas} width={900} height={420} aria-label="Handwriting canvas" onPointerDown={beginStroke} onPointerMove={moveStroke} onPointerUp={() => { drawing.current = false; }} onPointerCancel={() => { drawing.current = false; }} />
           <div className={styles.actions}><button type="button" className={styles.smallButton} onClick={addSketch} disabled={!hasSketch}>Add sketch</button><button type="button" className={styles.smallButton} onClick={clearSketch} disabled={!hasSketch}>Clear</button></div>
         </div>
+        {files.some((item) => isAudio(item.file)) && <p className={styles.copy} style={{ marginTop: 10 }}>On-device transcription is English-only, up to 2 minutes and 10 MiB. First use downloads about 45 MB of model files plus runtime from Hugging Face and a CDN; it may take several minutes. Audio is not sent to a transcription service. If signed in, normal sync may send the attachment and saved transcript to your configured server. Review the result for mistakes.</p>}
         {files.length > 0 && <div className={styles.fileList} aria-label="Files to attach">{files.map((item) => {
           const Icon = isImage(item.file) ? FileImage : isAudio(item.file) ? FileAudio : FileText;
-          return <div className={styles.fileRow} key={item.id}><Icon className={styles.fileIcon} size={16} /><div className={styles.fileInfo}><div className={styles.fileName} title={item.file.name}>{fileLabel(item.file)}</div><div className={styles.fileStatus} aria-live="polite">{item.message}</div></div><div className={styles.fileActions}>{item.state === "working" ? <button type="button" className={styles.textButton} onClick={() => cancelExtraction(item.id)}>Stop</button> : item.state === "done" ? <button type="button" className={styles.textButton} onClick={() => updateFile(item.id, { state: "ready", message: "Extracted text removed; the file will still be attached.", extracted: "" })}>Keep file only</button> : (isImage(item.file) || isPdf(item.file)) ? <button type="button" className={styles.textButton} onClick={() => void runExtraction(item, isPdf(item.file) ? "pdf" : "image")}>Make searchable</button> : null}<button type="button" className={styles.remove} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button></div></div>;
+          return <div className={styles.fileRow} key={item.id}><Icon className={styles.fileIcon} size={16} /><div className={styles.fileInfo}><div className={styles.fileName} title={item.file.name}>{fileLabel(item.file)}</div><div className={styles.fileStatus} aria-live="polite">{item.message}</div>{isAudio(item.file) && item.state === "done" && <label className={styles.transcriptLabel}>Review transcript<textarea className={styles.transcriptInput} value={item.extracted} onChange={(event) => updateFile(item.id, { extracted: event.target.value })} /></label>}</div><div className={styles.fileActions}>{item.state === "working" ? <button type="button" className={styles.textButton} onClick={() => cancelExtraction(item.id)}>Stop</button> : item.state === "done" ? <button type="button" className={styles.textButton} onClick={() => updateFile(item.id, { state: "ready", message: "Extracted text removed; the file will still be attached.", extracted: "" })}>Keep file only</button> : (isImage(item.file) || isPdf(item.file) || isAudio(item.file)) ? <button type="button" className={styles.textButton} onClick={() => void runExtraction(item, isPdf(item.file) ? "pdf" : isAudio(item.file) ? "audio" : "image")}>{isAudio(item.file) ? "Transcribe on device" : "Make searchable"}</button> : null}<button type="button" className={styles.remove} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button></div></div>;
         })}</div>}
         </fieldset>
       </div>
