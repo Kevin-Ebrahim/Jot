@@ -52,7 +52,7 @@ export function ShareDialog({ open, onClose, note, notebook }: {
   }, [open, targetKey, canManage, account.authenticatedRequest]);
 
   async function changeShare(method: 'POST' | 'PATCH' | 'DELETE', shareEmail: string, nextRole?: ShareRole) {
-    if (!target || busy || !canManage) return;
+    if (!target || busy || !canManage || (method !== 'DELETE' && target.syncState !== 'synced')) return;
     const current = sequence.current;
     setBusy(true); setError(null); setNotice(null);
     try {
@@ -111,13 +111,14 @@ export function ShareDialog({ open, onClose, note, notebook }: {
           <p className="collab-copy">You have {target.role === 'editor' ? 'editing' : 'viewing'} access. Only the owner can manage sharing for this {kind}.</p>
         )}
         {canManage && <>
+          {target.syncState !== 'synced' && <div className="collab-confirm"><p>{target.syncState === 'conflict' ? 'This item has an unresolved sync conflict. Resolve it before granting new access; you can still remove existing access.' : 'This item has local changes that are not yet on the server. Sync before granting access so people see the version you intend. You can still remove existing access.'}</p>{target.syncState !== 'conflict' && <button type="button" className="collab-button" onClick={syncFirst} disabled={busy}><RefreshCw size={15} aria-hidden="true" /> {busy ? 'Syncing…' : 'Sync now'}</button>}</div>}
           <p className="collab-copy">Add someone with an existing account on this Jot server. No email invitation is sent.</p>
           <form className="collab-share-form" onSubmit={addShare}>
             <label className="collab-sr-only" htmlFor="collab-share-email">Account email</label>
-            <input id="collab-share-email" className="collab-field" type="email" autoComplete="off" placeholder="Account email" required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} disabled={busy || loading} />
+            <input id="collab-share-email" className="collab-field" type="email" autoComplete="off" placeholder="Account email" required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} disabled={busy || loading || target.syncState !== 'synced'} />
             <label className="collab-sr-only" htmlFor="collab-share-role">Access level</label>
-            <select id="collab-share-role" className="collab-field collab-select" value={role} onChange={(event) => setRole(event.target.value as ShareRole)} disabled={busy || loading}><option value="viewer">Can view</option><option value="editor">Can edit</option></select>
-            <button className="collab-button collab-primary" type="submit" disabled={busy || loading}><UserPlus size={15} aria-hidden="true" /> Add</button>
+            <select id="collab-share-role" className="collab-field collab-select" value={role} onChange={(event) => setRole(event.target.value as ShareRole)} disabled={busy || loading || target.syncState !== 'synced'}><option value="viewer">Can view</option><option value="editor">Can edit</option></select>
+            <button className="collab-button collab-primary" type="submit" disabled={busy || loading || target.syncState !== 'synced'}><UserPlus size={15} aria-hidden="true" /> Add</button>
           </form>
           <div className="collab-list-heading"><Users size={15} aria-hidden="true" /> People with direct access</div>
           {loading ? <div className="collab-state" role="status"><LoaderCircle className="collab-spin" size={15} aria-hidden="true" /> Loading access…</div>
@@ -126,7 +127,7 @@ export function ShareDialog({ open, onClose, note, notebook }: {
                 <span className="collab-avatar collab-avatar-small" aria-hidden="true">{share.user.email.slice(0, 1).toUpperCase()}</span>
                 <span className="collab-share-email">{share.user.email}</span>
                 {revokeEmail === share.user.email ? <span className="collab-inline-confirm"><button type="button" className="collab-link collab-danger" disabled={busy} onClick={() => void changeShare('DELETE', share.user.email)}>Confirm remove</button><button type="button" className="collab-link" disabled={busy} onClick={() => setRevokeEmail(null)}>Cancel</button></span> : <>
-                  <select className="collab-inline-select" aria-label={`Access for ${share.user.email}`} value={share.role} disabled={busy} onChange={(event) => void changeShare('PATCH', share.user.email, event.target.value as ShareRole)}><option value="viewer">Can view</option><option value="editor">Can edit</option></select>
+                  <select className="collab-inline-select" aria-label={`Access for ${share.user.email}`} value={share.role} disabled={busy || target.syncState !== 'synced'} onChange={(event) => void changeShare('PATCH', share.user.email, event.target.value as ShareRole)}><option value="viewer">Can view</option><option value="editor">Can edit</option></select>
                   <button type="button" className="collab-link" disabled={busy} onClick={() => setRevokeEmail(share.user.email)} aria-label={`Remove ${share.user.email}`}>Remove</button>
                 </>}
               </li>)}</ul>}

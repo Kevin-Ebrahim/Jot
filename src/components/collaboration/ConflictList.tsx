@@ -18,7 +18,7 @@ function choiceText(conflict: SyncConflict, choice: Choice): string {
   if (choice === 'local') return 'Your current local version will be rebased on the server version and sent on the next sync. The server version will be replaced if that sync succeeds.';
   if (choice === 'server') return 'Your local version will be replaced by the server version. Its unsynced changes will be discarded.';
   return conflict.entity === 'note'
-    ? 'The server version stays on the original note. Your local version becomes a new, editable account-owned note in Inbox and will upload on the next sync.'
+    ? 'The server version stays on the original note. Your local version and its attached files become a new, editable account-owned note in Inbox and will upload on the next sync.'
     : 'The server notebook stays. A separate empty notebook copy is created from your local version; its notes are not duplicated.';
 }
 
